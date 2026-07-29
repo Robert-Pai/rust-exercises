@@ -27,13 +27,13 @@ pub struct Weibo {
 //         format!("{}发表了微博{}", self.username, self.content)
 //     }
 // }
-fn main() {
-    let post = Post{title: "Rust语言简介".to_string(),author: "Sunface".to_string(), content: "Rust棒极了!".to_string()};
-    let weibo = Weibo{username: "sunface".to_string(),content: "好像微博没Tweet好用".to_string()};
+// fn main() {
+//     let post = Post{title: "Rust语言简介".to_string(),author: "Sunface".to_string(), content: "Rust棒极了!".to_string()};
+//     let weibo = Weibo{username: "sunface".to_string(),content: "好像微博没Tweet好用".to_string()};
 
-    println!("{}",post.summarize());
-    println!("{}",weibo.summarize());
-}
+//     println!("{}",post.summarize());
+//     println!("{}",weibo.summarize());
+// }
 
 // 如果你想要为类型 A 实现特征 T，那么 A 或者 T 至少有一个是在当前作用域中定义的！
 
@@ -136,3 +136,62 @@ fn returns_summarizable() -> impl Summary {
 //         }
 //     }
 // }
+
+trait Pilot {
+    fn fly(&self);
+}
+
+trait Wizard {
+    fn fly(&self);
+}
+
+struct Human;
+
+impl Pilot for Human {
+    fn fly(&self) {
+        println!("This is your captain speaking.");
+    }
+}
+
+impl Wizard for Human {
+    fn fly(&self) {
+        println!("Up!");
+    }
+}
+
+impl Human {
+    fn fly(&self) {
+        println!("*waving arms furiously*");
+    }
+}
+// fn main() {
+//     let person = Human;
+//     Pilot::fly(&person); // 调用Pilot特征上的方法
+//     Wizard::fly(&person); // 调用Wizard特征上的方法
+//     person.fly(); // 调用Human类型自身的方法
+// }
+
+trait Animal {
+    fn baby_name() -> String;
+}
+
+struct Dog;
+
+impl Dog {
+    fn baby_name() -> String {
+        String::from("Spot")
+    }
+}
+
+impl Animal for Dog {
+    fn baby_name() -> String {
+        String::from("puppy")
+    }
+}
+
+fn main() {
+    println!("A baby dog is called a {}", Dog::baby_name());
+    // println!("A baby dog is called a {}", Animal::baby_name());
+    println!("A baby dog is called a {}", <Dog as Animal>::baby_name());
+    //<Type as Trait>::function(receiver_if_method, next_arg, ...);
+}

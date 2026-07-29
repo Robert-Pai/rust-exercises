@@ -1,3 +1,10 @@
+use std::fmt;
+use std::hash::Hash;
+
+// 占位 trait，代表可序列化/反序列化的能力
+pub trait Encodable {}
+pub trait Decodable {}
+
 trait Draw {
     fn draw(&self) -> String;
 }
@@ -56,3 +63,9 @@ impl Screen {
 // 不是所有特征都能拥有特征对象，只有对象安全的特征才行。当一个特征的所有方法都有如下属性时，它的对象才是安全的：
 // 方法的返回类型不能是 Self
 // 方法没有任何泛型参数
+
+//特征定义中的特征约束
+pub trait CacheableItem: Clone + Default + fmt::Debug + Decodable + Encodable {
+  type Address: AsRef<[u8]> + Clone + fmt::Debug + Eq + Hash;
+  fn is_null(&self) -> bool;
+}
