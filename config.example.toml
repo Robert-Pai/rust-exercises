@@ -1,0 +1,45 @@
+# LIVE MAINNET CONFIGURATION
+# Running the program immediately cancels every open order for `symbol` and
+# places real Binance USD-M Futures orders.
+
+[exchange]
+rest_url = "https://fapi.binance.com"
+websocket_url = "wss://fstream.binance.com"
+websocket_api_url = "wss://ws-fapi.binance.com/ws-fapi/v1"
+api_key = "replace-with-binance-api-key"
+private_key_pem = '''-----BEGIN PRIVATE KEY-----
+replace-with-binance-ed25519-pkcs8-private-key
+-----END PRIVATE KEY-----
+'''
+recv_window_ms = 5000
+request_timeout_ms = 5000
+listen_key_keepalive_secs = 1800
+websocket_idle_timeout_secs = 240
+
+[strategy]
+symbol = "BTCUSDT"
+levels_per_side = 5
+inner_ticks = 10
+spacing_ticks = 5
+take_profit_ticks = 3
+quantity = "0.001"
+
+[runtime]
+reconcile_interval_ms = 1000
+instrument_refresh_interval_secs = 3600
+reconnect_delay_ms = 1000
+strategy_mode = "busy_spin"
+# Zero-based selector resolved by core_affinity. Linux pins the thread to the
+# selected allowed logical CPU; macOS treats the value as a Mach affinity
+# hint/tag and may still migrate the thread.
+strategy_cpu_core = 1
+# Busy spin keeps the network Tokio runtime from parking while it waits for
+# socket readiness. Use "event_driven" to let the network thread sleep.
+network_mode = "busy_spin"
+# Keep this separate from the strategy core. Leave unset for no affinity.
+network_cpu_core = 2
+
+[logging]
+level = "info"
+directory = "logs"
+retention_days = 14
