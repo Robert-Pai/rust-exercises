@@ -33,11 +33,12 @@ strategy_mode = "busy_spin"
 # selected allowed logical CPU; macOS treats the value as a Mach affinity
 # hint/tag and may still migrate the thread.
 strategy_cpu_core = 1
-# Busy spin keeps the network Tokio runtime from parking while it waits for
-# socket readiness. Use "event_driven" to let the network thread sleep.
-network_mode = "busy_spin"
-# Keep this separate from the strategy core. Leave unset for no affinity.
-network_cpu_core = 2
+# Public book-ticker traffic is isolated on its own network thread.
+market_data_mode = "event_driven"
+market_data_cpu_core = 3
+# Private user-data and trading API traffic use the latency-prioritized thread.
+trading_mode = "busy_spin"
+trading_cpu_core = 2
 
 [logging]
 level = "info"

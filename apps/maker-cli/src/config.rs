@@ -66,6 +66,14 @@ impl AppConfig {
         LoggingSettings,
         StrategyRuntimeSettings,
     )> {
+        let market_data_mode = self
+            .runtime
+            .market_data_mode
+            .unwrap_or(ExecutionMode::EventDriven);
+        let trading_mode = self
+            .runtime
+            .trading_mode
+            .unwrap_or(ExecutionMode::EventDriven);
         let exchange = BinanceUsdmConfig::new(
             self.exchange.rest_url,
             self.exchange.websocket_url,
@@ -85,7 +93,12 @@ impl AppConfig {
             )?,
         )
         .context("invalid Binance adapter configuration")?
-        .with_network_runtime(self.runtime.network_mode, self.runtime.network_cpu_core);
+        .with_network_runtimes(
+            market_data_mode,
+            self.runtime.market_data_cpu_core,
+            trading_mode,
+            self.runtime.trading_cpu_core,
+        );
 
         let credentials = BinanceCredentials::new(
             SecretString::new(self.exchange.api_key),
@@ -177,9 +190,13 @@ struct RuntimeConfig {
     #[serde(default)]
     strategy_cpu_core: Option<usize>,
     #[serde(default)]
-    network_mode: ExecutionMode,
+    market_data_mode: Option<ExecutionMode>,
     #[serde(default)]
-    network_cpu_core: Option<usize>,
+    market_data_cpu_core: Option<usize>,
+    #[serde(default)]
+    trading_mode: Option<ExecutionMode>,
+    #[serde(default)]
+    trading_cpu_core: Option<usize>,
 }
 
 fn default_strategy_mode() -> ExecutionMode {
@@ -274,8 +291,10 @@ instrument_refresh_interval_secs = 3600
 reconnect_delay_ms = 1000
 strategy_mode = "busy_spin"
 strategy_cpu_core = 1
-network_mode = "busy_spin"
-network_cpu_core = 2
+market_data_mode = "event_driven"
+market_data_cpu_core = 3
+trading_mode = "busy_spin"
+trading_cpu_core = 2
 
 [logging]
 level = "info"
@@ -309,24 +328,30 @@ retention_days = 14
         assert_eq!(engine.take_profit_ticks().get(), 3);
         assert_eq!(runtime.mode, ExecutionMode::BusySpin);
         assert_eq!(runtime.cpu_core, Some(1));
-        assert_eq!(exchange.network_mode(), ExecutionMode::BusySpin);
-        assert_eq!(exchange.network_cpu_core(), Some(2));
+        assert_eq!(exchange.market_data_mode(), ExecutionMode::EventDriven);
+        assert_eq!(exchange.market_data_cpu_core(), Some(3));
+        assert_eq!(exchange.trading_mode(), ExecutionMode::BusySpin);
+        assert_eq!(exchange.trading_cpu_core(), Some(2));
         assert_eq!(logging.level(), LevelFilter::INFO);
         assert_eq!(logging.directory(), Path::new("logs"));
         assert_eq!(logging.retention_days(), 14);
     }
 
     #[test]
-    fn defaults_network_runtime_to_event_driven_without_affinity() {
+    fn defaults_split_network_runtimes_to_event_driven_without_affinity() {
         let contents = VALID_CONFIG
-            .replace("network_mode = \"busy_spin\"\n", "")
-            .replace("network_cpu_core = 2\n", "");
+            .replace("market_data_mode = \"event_driven\"\n", "")
+            .replace("market_data_cpu_core = 3\n", "")
+            .replace("trading_mode = \"busy_spin\"\n", "")
+            .replace("trading_cpu_core = 2\n", "");
         let file = config_file(&contents);
         let config = AppConfig::load(file.path()).unwrap();
         let (exchange, ..) = config.into_components().unwrap();
 
-        assert_eq!(exchange.network_mode(), ExecutionMode::EventDriven);
-        assert_eq!(exchange.network_cpu_core(), None);
+        assert_eq!(exchange.market_data_mode(), ExecutionMode::EventDriven);
+        assert_eq!(exchange.market_data_cpu_core(), None);
+        assert_eq!(exchange.trading_mode(), ExecutionMode::EventDriven);
+        assert_eq!(exchange.trading_cpu_core(), None);
     }
 
     #[test]

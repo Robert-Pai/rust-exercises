@@ -112,7 +112,7 @@ mod tests {
     impl InstrumentPort for MockExchange {
         async fn instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
             InstrumentSpec::new(
-                symbol.clone(),
+                *symbol,
                 MarketKind::LinearPerpetual,
                 Decimal::new(1, 1),
                 Decimal::new(1, 3),
@@ -133,7 +133,7 @@ mod tests {
     impl MarketDataPort for MockExchange {
         async fn best_bid_ask(&self, symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
             Ok(BestBidAsk::new(
-                symbol.clone(),
+                *symbol,
                 maker_domain::PriceTicks::new(99).unwrap(),
                 maker_domain::PriceTicks::new(100).unwrap(),
             )
@@ -152,9 +152,9 @@ mod tests {
     impl TradingPort for MockExchange {
         async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
             Ok(PlaceOrderAck::new(
-                intent.symbol().clone(),
-                intent.client_order_id().clone(),
-                maker_domain::ExchangeOrderId::new("1").unwrap(),
+                *intent.symbol(),
+                *intent.client_order_id(),
+                maker_domain::ExchangeOrderId::new(1).unwrap(),
             ))
         }
 

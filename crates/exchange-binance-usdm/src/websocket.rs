@@ -179,7 +179,7 @@ async fn run_order_updates(
                                 // Binance user-data streams are account-wide. Ignore
                                 // other symbols before consulting the single-symbol
                                 // instrument cache used by this adapter.
-                                if !is_target_limit_order(&target_symbol, &order) {
+                                if !is_owned_target_limit_order(&target_symbol, &order) {
                                     continue;
                                 }
                                 let spec = match adapter.cached_instrument_spec(&target_symbol) {
@@ -264,11 +264,13 @@ fn stream_endpoint(base: &str, stream_name: &str) -> String {
     }
 }
 
-fn is_target_limit_order(
+fn is_owned_target_limit_order(
     target_symbol: &Symbol,
-    order: &crate::models::OrderTradeEventDto,
+    order: &crate::models::OrderTradeEventDto<'_>,
 ) -> bool {
-    order.order_type == "LIMIT" && order.symbol == target_symbol.as_str()
+    order.order_type == "LIMIT"
+        && order.symbol == target_symbol.as_str()
+        && order.client_order_id.parse::<u64>().is_ok()
 }
 
 #[cfg(test)]
@@ -276,17 +278,17 @@ mod tests {
     use super::*;
     use crate::models::OrderTradeEventDto;
 
-    fn order(symbol: &str, order_type: &str) -> OrderTradeEventDto {
+    fn order<'a>(symbol: &'a str, order_type: &'a str) -> OrderTradeEventDto<'a> {
         OrderTradeEventDto {
-            symbol: symbol.to_owned(),
-            client_order_id: "maker-1".to_owned(),
+            symbol,
+            client_order_id: "1",
             order_id: 1,
-            side: "BUY".to_owned(),
-            order_type: order_type.to_owned(),
-            price: "1".to_owned(),
-            original_quantity: "1".to_owned(),
-            cumulative_filled: "0".to_owned(),
-            status: "NEW".to_owned(),
+            side: "BUY",
+            order_type,
+            price: "1",
+            original_quantity: "1",
+            cumulative_filled: "0",
+            status: "NEW",
         }
     }
 
@@ -306,8 +308,20 @@ mod tests {
     fn filters_account_order_events_before_instrument_lookup() {
         let target = Symbol::new("BTCUSDT").unwrap();
 
-        assert!(!is_target_limit_order(&target, &order("ETHUSDT", "LIMIT")));
-        assert!(!is_target_limit_order(&target, &order("BTCUSDT", "MARKET")));
-        assert!(is_target_limit_order(&target, &order("BTCUSDT", "LIMIT")));
+        assert!(!is_owned_target_limit_order(
+            &target,
+            &order("ETHUSDT", "LIMIT")
+        ));
+        assert!(!is_owned_target_limit_order(
+            &target,
+            &order("BTCUSDT", "MARKET")
+        ));
+        assert!(is_owned_target_limit_order(
+            &target,
+            &order("BTCUSDT", "LIMIT")
+        ));
+        let mut external = order("BTCUSDT", "LIMIT");
+        external.client_order_id = "manual-order";
+        assert!(!is_owned_target_limit_order(&target, &external));
     }
 }

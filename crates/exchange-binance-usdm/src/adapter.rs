@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
     mapping,
-    network::NetworkRuntime,
+    network::{NetworkRole, NetworkRuntime},
     rest::RestClient,
     websocket,
     ws_api::WsApiClient,
@@ -21,7 +21,8 @@ use maker_ports::{
 #[derive(Clone)]
 pub struct BinanceUsdm {
     rest: RestClient,
-    network: NetworkRuntime,
+    market_network: NetworkRuntime,
+    trading_network: NetworkRuntime,
     trading: WsApiClient,
     websocket_url: Arc<str>,
     websocket_connect_timeout: Duration,
@@ -33,11 +34,22 @@ pub struct BinanceUsdm {
 impl BinanceUsdm {
     pub fn new(config: BinanceUsdmConfig, credentials: BinanceCredentials) -> ExchangeResult<Self> {
         let rest = RestClient::new(&config, credentials.clone())?;
-        let network = NetworkRuntime::new(config.network_mode(), config.network_cpu_core())?;
-        let trading = WsApiClient::new(&config, credentials, rest.clone(), network.clone())?;
+        let market_network = NetworkRuntime::new(
+            NetworkRole::MarketData,
+            config.market_data_mode(),
+            config.market_data_cpu_core(),
+        )?;
+        let trading_network = NetworkRuntime::new(
+            NetworkRole::Trading,
+            config.trading_mode(),
+            config.trading_cpu_core(),
+        )?;
+        let trading =
+            WsApiClient::new(&config, credentials, rest.clone(), trading_network.clone())?;
         Ok(Self {
             rest,
-            network,
+            market_network,
+            trading_network,
             trading,
             websocket_url: Arc::from(config.websocket_url()),
             websocket_connect_timeout: config.request_timeout(),
@@ -58,9 +70,9 @@ impl BinanceUsdm {
 
     async fn load_instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
         let rest = self.rest.clone();
-        let symbol_for_request = symbol.clone();
+        let symbol_for_request = *symbol;
         let wire = self
-            .network
+            .market_network
             .call(async move { rest.exchange_symbol(&symbol_for_request).await })
             .await?;
         let spec = mapping::instrument(symbol, wire)?;
@@ -71,7 +83,7 @@ impl BinanceUsdm {
     fn replace_instrument_spec(&self, spec: InstrumentSpec) {
         let current = self.instruments.load_full();
         let mut updated = (*current).clone();
-        updated.insert(spec.symbol().clone(), spec);
+        updated.insert(*spec.symbol(), spec);
         self.instruments.store(Arc::new(updated));
     }
 
@@ -103,9 +115,9 @@ impl InstrumentPort for BinanceUsdm {
 
     async fn refresh_instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
         let rest = self.rest.clone();
-        let symbol_for_request = symbol.clone();
+        let symbol_for_request = *symbol;
         let wire = self
-            .network
+            .market_network
             .call(async move { rest.exchange_symbol(&symbol_for_request).await })
             .await?;
         mapping::instrument(symbol, wire)
@@ -118,7 +130,7 @@ impl InstrumentPort for BinanceUsdm {
 
     async fn position_mode(&self) -> ExchangeResult<PositionMode> {
         let rest = self.rest.clone();
-        self.network
+        self.trading_network
             .call(async move { rest.position_mode().await })
             .await
             .map(mapping::position_mode)
@@ -130,9 +142,9 @@ impl MarketDataPort for BinanceUsdm {
     async fn best_bid_ask(&self, symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
         let spec = self.cached_instrument_spec(symbol)?;
         let rest = self.rest.clone();
-        let symbol_for_request = symbol.clone();
+        let symbol_for_request = *symbol;
         let wire = self
-            .network
+            .market_network
             .call(async move { rest.book_ticker(&symbol_for_request).await })
             .await?;
         mapping::rest_book(symbol, &spec, wire)
@@ -144,9 +156,9 @@ impl MarketDataPort for BinanceUsdm {
     ) -> ExchangeResult<EventStream<BestBidAsk>> {
         let spec = self.cached_instrument_spec(symbol)?;
         websocket::subscribe_book_ticker(
-            self.network.clone(),
+            self.market_network.clone(),
             &self.websocket_url,
-            symbol.clone(),
+            *symbol,
             spec,
             self.websocket_connect_timeout,
             self.websocket_idle_timeout,
@@ -158,8 +170,8 @@ impl MarketDataPort for BinanceUsdm {
 #[async_trait]
 impl TradingPort for BinanceUsdm {
     async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
-        let symbol = intent.symbol().clone();
-        let client_order_id = intent.client_order_id().clone();
+        let symbol = *intent.symbol();
+        let client_order_id = *intent.client_order_id();
         let spec = self.cached_instrument_spec(&symbol)?;
         let wire = self.trading.place_order(&spec, &intent).await?;
         mapping::ws_api_order_ack(&symbol, &client_order_id, wire)
@@ -195,10 +207,10 @@ impl OrderEventPort for BinanceUsdm {
         symbol: &Symbol,
     ) -> ExchangeResult<EventStream<OrderUpdate>> {
         websocket::subscribe_order_updates(
-            self.network.clone(),
+            self.trading_network.clone(),
             self.clone(),
             self.rest.clone(),
-            symbol.clone(),
+            *symbol,
             &self.websocket_url,
             self.websocket_connect_timeout,
             self.websocket_idle_timeout,
@@ -237,8 +249,8 @@ mod tests {
     fn accepts_terminal_cancel_resolution() {
         let update = OrderUpdate::new(
             Symbol::new("BTCUSDT").unwrap(),
-            ClientOrderId::new("maker-1").unwrap(),
-            ExchangeOrderId::new("1").unwrap(),
+            ClientOrderId::new(1).unwrap(),
+            ExchangeOrderId::new(1).unwrap(),
             Side::Buy,
             PriceTicks::new(100).unwrap(),
             QuantityLots::new(1).unwrap(),
@@ -248,7 +260,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            terminal_cancel_outcome(update.clone()).unwrap(),
+            terminal_cancel_outcome(update).unwrap(),
             CancelOutcome::Terminal(update)
         );
     }
@@ -257,8 +269,8 @@ mod tests {
     fn rejects_non_terminal_cancel_resolution() {
         let update = OrderUpdate::new(
             Symbol::new("BTCUSDT").unwrap(),
-            ClientOrderId::new("maker-1").unwrap(),
-            ExchangeOrderId::new("1").unwrap(),
+            ClientOrderId::new(1).unwrap(),
+            ExchangeOrderId::new(1).unwrap(),
             Side::Buy,
             PriceTicks::new(100).unwrap(),
             QuantityLots::new(1).unwrap(),
@@ -289,7 +301,7 @@ mod tests {
         );
 
         let spec = InstrumentSpec::new(
-            symbol.clone(),
+            symbol,
             MarketKind::LinearPerpetual,
             Decimal::ONE,
             Decimal::new(1, 3),

@@ -8,11 +8,11 @@ pub enum PositionMode {
 }
 
 /// Identity assigned to a successfully accepted order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaceOrderAck {
-    symbol: Symbol,
     client_order_id: ClientOrderId,
     exchange_order_id: ExchangeOrderId,
+    symbol: Symbol,
 }
 
 impl PlaceOrderAck {
@@ -42,7 +42,7 @@ impl PlaceOrderAck {
 }
 
 /// The terminal resolution of a single-order cancellation request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancelOutcome {
     /// The exchange acknowledged cancellation but supplied no full update.
     Canceled,
@@ -74,8 +74,8 @@ mod tests {
     fn exposes_terminal_cancel_update() {
         let update = OrderUpdate::new(
             Symbol::new("BTCUSDT").unwrap(),
-            ClientOrderId::new("maker-1").unwrap(),
-            ExchangeOrderId::new("42").unwrap(),
+            ClientOrderId::new(1).unwrap(),
+            ExchangeOrderId::new(42).unwrap(),
             Side::Buy,
             PriceTicks::new(100).unwrap(),
             QuantityLots::new(2).unwrap(),
@@ -83,7 +83,7 @@ mod tests {
             OrderStatus::Filled,
         )
         .unwrap();
-        let outcome = CancelOutcome::Terminal(update.clone());
+        let outcome = CancelOutcome::Terminal(update);
 
         assert_eq!(outcome.terminal_update(), Some(&update));
         assert_eq!(CancelOutcome::Canceled.terminal_update(), None);

@@ -23,7 +23,9 @@ use tracing::{debug, info, warn};
 use crate::{EngineConfig, EngineError, OrderRegistry};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
-const SESSION_MASK: u64 = (1_u64 << 48) - 1;
+const SESSION_MASK: u64 = u32::MAX as u64;
+const CLIENT_GENERATION_SHIFT: u32 = 24;
+const CLIENT_SEQUENCE_MAX: u32 = (1 << CLIENT_GENERATION_SHIFT) - 1;
 
 /// Coarse lifecycle phase of the engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,9 +57,8 @@ pub struct MakerEngine {
     pending_fills: HashMap<ClientOrderId, PendingFill>,
     pending_fill_order: VecDeque<ClientOrderId>,
     placement_priority: Vec<GridLevel>,
-    session_seed: u64,
-    session_generation: u16,
-    client_id_prefix: String,
+    session_seed: u32,
+    session_generation: u8,
     next_order_sequence: u32,
 }
 
@@ -67,7 +68,7 @@ impl MakerEngine {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos() as u64);
         let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let session_seed = (clock ^ counter.rotate_left(17)) & SESSION_MASK;
+        let session_seed = ((clock ^ counter.rotate_left(17)) & SESSION_MASK) as u32;
 
         Self {
             config,
@@ -91,7 +92,6 @@ impl MakerEngine {
             placement_priority: Vec::new(),
             session_seed,
             session_generation: 0,
-            client_id_prefix: String::new(),
             next_order_sequence: 0,
         }
     }
@@ -269,7 +269,7 @@ impl MakerEngine {
         if rebuild_grid {
             self.begin_session()?;
             self.instrument = Some(instrument.clone());
-            self.latest_book = Some(book.clone());
+            self.latest_book = Some(book);
             let quantity = instrument.quantity_to_lots_exact(self.config.quantity())?;
             let grid_config = GridConfig::new(
                 self.config.levels_per_side(),
@@ -293,7 +293,7 @@ impl MakerEngine {
                 .expect("preserving recovery requires an instrument specification");
             if current != &instrument {
                 return Err(EngineError::InstrumentRulesChanged {
-                    symbol: self.config.symbol().clone(),
+                    symbol: *self.config.symbol(),
                 });
             }
             if self.grid.is_none() {
@@ -322,8 +322,8 @@ impl MakerEngine {
     fn validate_instrument(&self, instrument: &InstrumentSpec) -> Result<(), EngineError> {
         if instrument.symbol() != self.config.symbol() {
             return Err(EngineError::SymbolMismatch {
-                expected: self.config.symbol().clone(),
-                actual: instrument.symbol().clone(),
+                expected: *self.config.symbol(),
+                actual: *instrument.symbol(),
             });
         }
         Ok(())
@@ -332,8 +332,8 @@ impl MakerEngine {
     fn validate_book(&self, book: &BestBidAsk) -> Result<(), EngineError> {
         if book.symbol() != self.config.symbol() {
             return Err(EngineError::SymbolMismatch {
-                expected: self.config.symbol().clone(),
-                actual: book.symbol().clone(),
+                expected: *self.config.symbol(),
+                actual: *book.symbol(),
             });
         }
         Ok(())
@@ -344,10 +344,6 @@ impl MakerEngine {
             .session_generation
             .checked_add(1)
             .ok_or(EngineError::SessionOverflow)?;
-        self.client_id_prefix = format!(
-            "mk{:012x}{:04x}",
-            self.session_seed, self.session_generation
-        );
         self.next_order_sequence = 0;
         self.grid = None;
         self.instrument = None;
@@ -467,10 +463,8 @@ impl MakerEngine {
         if update.symbol() != self.config.symbol() {
             return Ok(());
         }
-        if !update
-            .client_order_id()
-            .as_str()
-            .starts_with(&self.client_id_prefix)
+        if (update.client_order_id().get() >> CLIENT_GENERATION_SHIFT)
+            != self.current_client_id_prefix()
         {
             return Ok(());
         }
@@ -501,7 +495,7 @@ impl MakerEngine {
             {
                 validate_attempt_update(level, &update)?;
                 self.pre_ack_updates
-                    .insert(update.client_order_id().clone(), update);
+                    .insert(*update.client_order_id(), update);
             }
             return Ok(());
         }
@@ -533,10 +527,10 @@ impl MakerEngine {
                 self.finish_fill(update.client_order_id());
             }
             Err(error) if is_deferrable_fill(&error) => {
-                let client_order_id = update.client_order_id().clone();
+                let client_order_id = *update.client_order_id();
                 let was_pending = self
                     .pending_fills
-                    .insert(client_order_id.clone(), PendingFill { update, level });
+                    .insert(client_order_id, PendingFill { update, level });
                 if was_pending.is_none() {
                     self.pending_fill_order.push_back(client_order_id);
                 }
@@ -695,7 +689,7 @@ impl MakerEngine {
                     && !self.inflight_cancels.contains(order.client_order_id())
                     && !self.deferred_cancels.contains(order.client_order_id())
             })
-            .map(|order| (order.client_order_id().clone(), order.level()))
+            .map(|order| (*order.client_order_id(), order.level()))
             .collect();
         undesired.sort_by_key(|(_, level)| (level.side(), level.price()));
         for (client_order_id, _) in undesired {
@@ -726,15 +720,14 @@ impl MakerEngine {
         {
             let client_order_id = self.next_client_order_id()?;
             let intent = OrderIntent::post_only(
-                self.config.symbol().clone(),
-                client_order_id.clone(),
+                *self.config.symbol(),
+                client_order_id,
                 level.side(),
                 level.price(),
                 level.quantity(),
             );
-            self.placement_attempts
-                .insert(client_order_id.clone(), level);
-            self.inflight_placements.insert(client_order_id.clone());
+            self.placement_attempts.insert(client_order_id, level);
+            self.inflight_placements.insert(client_order_id);
             blocked_levels.push(level);
 
             let exchange = self.exchange.clone();
@@ -760,9 +753,9 @@ impl MakerEngine {
         client_order_id: ClientOrderId,
         kind: CancellationKind,
     ) {
-        self.inflight_cancels.insert(client_order_id.clone());
+        self.inflight_cancels.insert(client_order_id);
         let exchange = self.exchange.clone();
-        let symbol = self.config.symbol().clone();
+        let symbol = *self.config.symbol();
         commands.push(
             async move {
                 let result = exchange.cancel_order(&symbol, &client_order_id).await;
@@ -779,7 +772,7 @@ impl MakerEngine {
     fn schedule_instrument_refresh(&mut self, commands: &mut FuturesUnordered<CommandFuture>) {
         self.instrument_refresh_inflight = true;
         let exchange = self.exchange.clone();
-        let symbol = self.config.symbol().clone();
+        let symbol = *self.config.symbol();
         commands.push(
             async move {
                 let result = exchange.refresh_instrument_spec(&symbol).await;
@@ -835,7 +828,7 @@ impl MakerEngine {
                 .apply_instrument_spec(refreshed)
                 .map_err(|error| EngineError::exchange("apply refreshed instrument", error))?;
             return Err(EngineError::InstrumentRulesChanged {
-                symbol: self.config.symbol().clone(),
+                symbol: *self.config.symbol(),
             });
         }
         Ok(())
@@ -894,7 +887,7 @@ impl MakerEngine {
                 let may_exist = placement_may_exist(error.kind())
                     || self.pre_ack_updates.contains_key(&client_order_id);
                 if may_exist {
-                    self.unresolved_attempts.insert(client_order_id.clone());
+                    self.unresolved_attempts.insert(client_order_id);
                 } else {
                     self.placement_attempts.remove(&client_order_id);
                     self.pre_ack_updates.remove(&client_order_id);
@@ -969,7 +962,7 @@ impl MakerEngine {
                 if engine_error.exchange_is_fatal() {
                     return Err(engine_error);
                 }
-                self.deferred_cancels.insert(client_order_id.clone());
+                self.deferred_cancels.insert(client_order_id);
                 warn!(
                     symbol = %self.config.symbol(),
                     client_order_id = %client_order_id,
@@ -1075,16 +1068,18 @@ impl MakerEngine {
         Ok(())
     }
 
+    fn current_client_id_prefix(&self) -> u64 {
+        (u64::from(self.session_seed) << 8) | u64::from(self.session_generation)
+    }
+
     fn next_client_order_id(&mut self) -> Result<ClientOrderId, EngineError> {
-        self.next_order_sequence = self
-            .next_order_sequence
-            .checked_add(1)
-            .ok_or(EngineError::OrderSequenceOverflow)?;
-        ClientOrderId::new(format!(
-            "{}{:08x}",
-            self.client_id_prefix, self.next_order_sequence
-        ))
-        .map_err(Into::into)
+        if self.next_order_sequence == CLIENT_SEQUENCE_MAX {
+            return Err(EngineError::OrderSequenceOverflow);
+        }
+        self.next_order_sequence += 1;
+        let value = (self.current_client_id_prefix() << CLIENT_GENERATION_SHIFT)
+            | u64::from(self.next_order_sequence);
+        ClientOrderId::new(value).map_err(Into::into)
     }
 
     fn current_level_for(&self, candidate: GridLevel) -> GridLevel {
@@ -1098,7 +1093,7 @@ impl MakerEngine {
     fn finish_fill(&mut self, client_order_id: &ClientOrderId) {
         self.registry.discard(client_order_id);
         if self.inflight_placements.contains(client_order_id) {
-            self.filled_before_ack.insert(client_order_id.clone());
+            self.filled_before_ack.insert(*client_order_id);
         }
         self.placement_attempts.remove(client_order_id);
         self.pre_ack_updates.remove(client_order_id);
@@ -1117,7 +1112,7 @@ impl MakerEngine {
             .registry
             .active_orders()
             .into_iter()
-            .map(|order| order.client_order_id().clone())
+            .map(|order| *order.client_order_id())
             .collect();
         client_order_ids.extend(self.placement_attempts.keys().cloned());
         client_order_ids.extend(self.pending_fills.keys().cloned());
@@ -1208,10 +1203,6 @@ impl MakerEngine {
             .session_generation
             .checked_add(1)
             .ok_or(EngineError::SessionOverflow)?;
-        self.client_id_prefix = format!(
-            "mk{:012x}{:04x}",
-            self.session_seed, self.session_generation
-        );
         self.next_order_sequence = 0;
         self.registry.clear();
         self.placement_attempts.clear();

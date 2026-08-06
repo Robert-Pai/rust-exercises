@@ -125,7 +125,7 @@ impl WsApiClient {
         let parameters = Parameters::from([
             (
                 "newClientOrderId".to_owned(),
-                json!(intent.client_order_id().as_str()),
+                json!(intent.client_order_id().to_string()),
             ),
             ("newOrderRespType".to_owned(), json!("ACK")),
             ("positionSide".to_owned(), json!("BOTH")),
@@ -470,7 +470,7 @@ fn order_identity_parameters(symbol: &Symbol, client_order_id: &ClientOrderId) -
     Parameters::from([
         (
             "origClientOrderId".to_owned(),
-            json!(client_order_id.as_str()),
+            json!(client_order_id.to_string()),
         ),
         ("symbol".to_owned(), json!(symbol.as_str())),
     ])
@@ -601,7 +601,7 @@ mod tests {
                 let result = match method {
                     "order.place" => json!({
                         "symbol": "BTCUSDT",
-                        "clientOrderId": "maker-1",
+                        "clientOrderId": "1",
                         "orderId": 42
                     }),
                     "order.cancel" => order_result("CANCELED", "0.000"),
@@ -639,13 +639,18 @@ mod tests {
         )
         .unwrap();
         let rest = RestClient::new(&config, credentials.clone()).unwrap();
-        let network = NetworkRuntime::new(maker_runtime::ExecutionMode::EventDriven, None).unwrap();
+        let network = NetworkRuntime::new(
+            crate::network::NetworkRole::Trading,
+            maker_runtime::ExecutionMode::EventDriven,
+            None,
+        )
+        .unwrap();
         let client = WsApiClient::new(&config, credentials, rest, network).unwrap();
         let symbol = Symbol::new("BTCUSDT").unwrap();
-        let client_order_id = ClientOrderId::new("maker-1").unwrap();
+        let client_order_id = ClientOrderId::new(1).unwrap();
         let intent = OrderIntent::post_only(
-            symbol.clone(),
-            client_order_id.clone(),
+            symbol,
+            client_order_id,
             Side::Buy,
             PriceTicks::new(640_001).unwrap(),
             QuantityLots::new(1).unwrap(),
@@ -669,7 +674,7 @@ mod tests {
     fn order_result(status: &str, executed_quantity: &str) -> Value {
         json!({
             "symbol": "BTCUSDT",
-            "clientOrderId": "maker-1",
+            "clientOrderId": "1",
             "orderId": 42,
             "side": "BUY",
             "price": "64000.1",

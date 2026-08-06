@@ -53,7 +53,7 @@ pub(crate) fn instrument(
     })?;
 
     InstrumentSpec::new(
-        requested_symbol.clone(),
+        *requested_symbol,
         MarketKind::LinearPerpetual,
         tick_size,
         parse_decimal("exchangeInfo LOT_SIZE.stepSize", step_size)?,
@@ -77,8 +77,8 @@ pub(crate) fn websocket_book(
     spec: &InstrumentSpec,
     wire: BookTickerEventDto,
 ) -> ExchangeResult<BestBidAsk> {
-    ensure_symbol(requested_symbol, &wire.symbol, "bookTicker event")?;
-    book(requested_symbol, spec, &wire.bid_price, &wire.ask_price)
+    ensure_symbol(requested_symbol, wire.symbol, "bookTicker event")?;
+    book(requested_symbol, spec, wire.bid_price, wire.ask_price)
 }
 
 fn book(
@@ -89,8 +89,7 @@ fn book(
 ) -> ExchangeResult<BestBidAsk> {
     let bid = price_ticks(spec, "best bid", bid)?;
     let ask = price_ticks(spec, "best ask", ask)?;
-    BestBidAsk::new(symbol.clone(), bid, ask)
-        .map_err(|error| invalid_response("best bid/ask", error))
+    BestBidAsk::new(*symbol, bid, ask).map_err(|error| invalid_response("best bid/ask", error))
 }
 
 pub(crate) fn position_mode(wire: DualSidePositionDto) -> PositionMode {
@@ -107,15 +106,19 @@ pub(crate) fn ws_api_order_ack(
     wire: WsApiOrderAckDto,
 ) -> ExchangeResult<PlaceOrderAck> {
     ensure_symbol(expected_symbol, &wire.symbol, "new order response")?;
-    if wire.client_order_id != expected_client_id.as_str() {
+    let wire_client_id = wire
+        .client_order_id
+        .parse::<u64>()
+        .map_err(|error| invalid_response("client order ID", error))?;
+    if wire_client_id != expected_client_id.get() {
         return Err(ExchangeError::new(
             ExchangeErrorKind::InvalidResponse,
             "Binance new order response contained a different client order ID",
         ));
     }
     Ok(PlaceOrderAck::new(
-        expected_symbol.clone(),
-        expected_client_id.clone(),
+        *expected_symbol,
+        *expected_client_id,
         exchange_order_id(wire.order_id)?,
     ))
 }
@@ -127,7 +130,7 @@ pub(crate) fn ws_api_order(
 ) -> ExchangeResult<OrderUpdate> {
     ensure_symbol(expected_symbol, &wire.symbol, "order response")?;
     normalized_order(
-        expected_symbol.clone(),
+        *expected_symbol,
         &wire.client_order_id,
         wire.order_id,
         &wire.side,
@@ -146,17 +149,17 @@ pub(crate) fn websocket_order(
     if wire.order_type != "LIMIT" {
         return Ok(None);
     }
-    let symbol = Symbol::new(wire.symbol.clone())
-        .map_err(|error| invalid_response("order event symbol", error))?;
+    let symbol =
+        Symbol::new(wire.symbol).map_err(|error| invalid_response("order event symbol", error))?;
     normalized_order(
         symbol,
-        &wire.client_order_id,
+        wire.client_order_id,
         wire.order_id,
-        &wire.side,
-        &wire.price,
-        &wire.original_quantity,
-        &wire.cumulative_filled,
-        &wire.status,
+        wire.side,
+        wire.price,
+        wire.original_quantity,
+        wire.cumulative_filled,
+        wire.status,
         spec,
     )
     .map(Some)
@@ -185,8 +188,12 @@ fn normalized_order(
     let cumulative_filled = filled_lots(spec, "cumulative filled quantity", cumulative_filled)?;
     OrderUpdate::new(
         symbol,
-        ClientOrderId::new(client_id)
-            .map_err(|error| invalid_response("client order ID", error))?,
+        ClientOrderId::new(
+            client_id
+                .parse::<u64>()
+                .map_err(|error| invalid_response("client order ID", error))?,
+        )
+        .map_err(|error| invalid_response("client order ID", error))?,
         exchange_order_id(order_id)?,
         parse_side(side)?,
         price_ticks(spec, "order price", price)?,
@@ -290,8 +297,7 @@ fn parse_decimal(field: &str, value: &str) -> ExchangeResult<Decimal> {
 }
 
 fn exchange_order_id(value: u64) -> ExchangeResult<ExchangeOrderId> {
-    ExchangeOrderId::new(value.to_string())
-        .map_err(|error| invalid_response("exchange order ID", error))
+    ExchangeOrderId::new(value).map_err(|error| invalid_response("exchange order ID", error))
 }
 
 fn ensure_symbol(expected: &Symbol, actual: &str, context: &str) -> ExchangeResult<()> {
@@ -372,7 +378,7 @@ mod tests {
             "E":1700000000000,
             "T":1700000000000,
             "o":{
-                "s":"BTCUSDT","c":"maker-ask-1","S":"SELL","o":"LIMIT",
+                "s":"BTCUSDT","c":"12345","S":"SELL","o":"LIMIT",
                 "f":"GTX","q":"0.003","p":"64000.1","ap":"64000.1",
                 "x":"TRADE","X":"FILLED","i":987654321,"l":"0.003","z":"0.003"
             }
@@ -385,8 +391,8 @@ mod tests {
         let update = websocket_order(&spec(), order).unwrap().unwrap();
 
         assert_eq!(update.symbol(), &symbol());
-        assert_eq!(update.client_order_id().as_str(), "maker-ask-1");
-        assert_eq!(update.exchange_order_id().as_str(), "987654321");
+        assert_eq!(update.client_order_id().get(), 12345);
+        assert_eq!(update.exchange_order_id().get(), 987654321);
         assert_eq!(update.side(), Side::Sell);
         assert_eq!(update.price().get(), 640_001);
         assert_eq!(update.original_quantity().get(), 3);
@@ -406,7 +412,7 @@ mod tests {
         )
         .unwrap();
         let json = r#"{
-            "s":"BTCUSDT","c":"maker-bid-1","S":"BUY","o":"LIMIT",
+            "s":"BTCUSDT","c":"12346","S":"BUY","o":"LIMIT",
             "q":"0.010","p":"64000.1","z":"0.001","X":"PARTIALLY_FILLED","i":7
         }"#;
         let wire: OrderTradeEventDto = serde_json::from_str(json).unwrap();

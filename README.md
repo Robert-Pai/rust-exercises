@@ -86,34 +86,40 @@ shutdown and symbol-wide order cancellation.
 maker-domain            exact values and pure rolling-grid transitions
 maker-ports             exchange-neutral async capabilities
 maker-engine            single-owner lifecycle and reconciliation loop
-exchange-binance-usdm   Binance REST adapter plus dedicated network runtime
+exchange-binance-usdm   Binance REST adapter plus isolated network runtimes
 maker-cli               configuration and dependency composition
 ```
 
-The Binance adapter owns a dedicated `maker-network` OS thread. That thread
-runs a single-thread Tokio runtime and schedules all stream WebSocket readers,
-the private stream keepalive, the trading WebSocket API worker, and adapter
-REST requests. Strategy calls cross into it through asynchronous channels; no
-exchange network I/O runs on the strategy runtime. By default,
-`runtime.network_mode = "event_driven"` lets Tokio park the thread when no I/O
-or timer is ready. `"busy_spin"` continuously self-wakes the runtime so Tokio
-uses non-blocking driver polls instead of parking; this consumes one CPU core
-and can reduce local wake-up jitter, but it does not bypass Tokio, socket
-readiness, or the kernel TCP stack. `runtime.network_cpu_core` optionally gives
-the network thread its own logical CPU selector.
+The Binance adapter owns two isolated network OS threads, each running a
+current-thread Tokio runtime. `maker-network-market-data` handles instrument
+metadata, book-ticker REST, and the public book-ticker WebSocket.
+`maker-network-trading` handles position mode, the private user-data stream and
+listen-key keepalive, trading WebSocket API requests, and clock synchronization.
+Both share the same cloneable REST client state, but public market bursts cannot
+consume scheduler time on the latency-critical private/trading runtime.
+
+`runtime.market_data_mode` and `runtime.trading_mode` independently select
+`"event_driven"` or `"busy_spin"`. Event-driven runtimes park when no I/O or
+timer is ready. Busy-spin runtimes continuously self-wake so Tokio uses
+non-blocking driver polls instead of parking; this consumes one CPU core and can
+reduce local wake-up jitter, but it does not bypass Tokio, socket readiness, or
+the kernel TCP stack. `runtime.market_data_cpu_core` and
+`runtime.trading_cpu_core` independently select logical CPUs.
 
 The engine owns a separate `maker-strategy` OS thread and a current-thread
 Tokio runtime. `runtime.strategy_mode = "event_driven"` lets that runtime park
 when idle. The default `"busy_spin"` mode self-wakes the runtime after every
 pending poll. Tokio therefore performs a non-blocking driver poll (I/O and
 timers) before polling the strategy again, instead of parking the thread; it
-consumes one CPU core continuously. The strategy and network CPU selectors are
-resolved by `core_affinity`; they should name separate logical CPUs. On Linux
-each selector indexes the CPUs allowed to the process and installs a hard
-single-CPU affinity mask. On macOS each value is translated to a nonzero Mach
-affinity tag; tags only express scheduler relationships and threads can still
-migrate, so neither setting guarantees execution on one physical or logical
-core.
+consumes one CPU core continuously. The strategy, market-data, and trading CPU
+selectors are resolved by `core_affinity`; they should name separate logical
+CPUs. On a four-core low-latency host, the example reserves core 1 for strategy,
+core 2 for private trading, core 3 for public market data, and leaves core 0 for
+the OS, logging, and kernel network work. On Linux each selector indexes the
+CPUs allowed to the process and installs a hard single-CPU affinity mask. On
+macOS each value is translated to a nonzero Mach affinity tag; tags only express
+scheduler relationships and threads can still migrate, so the settings do not
+guarantee execution on specific physical or logical cores.
 
 ## Verify
 

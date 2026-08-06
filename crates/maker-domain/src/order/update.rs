@@ -5,15 +5,15 @@ use crate::{ClientOrderId, ExchangeOrderId, FilledLots, PriceTicks, QuantityLots
 use super::OrderStatus;
 
 /// A normalized exchange order update.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderUpdate {
-    symbol: Symbol,
-    client_order_id: ClientOrderId,
-    exchange_order_id: ExchangeOrderId,
-    side: Side,
     price: PriceTicks,
     original_quantity: QuantityLots,
     cumulative_filled: FilledLots,
+    client_order_id: ClientOrderId,
+    exchange_order_id: ExchangeOrderId,
+    symbol: Symbol,
+    side: Side,
     status: OrderStatus,
 }
 
@@ -108,14 +108,19 @@ mod tests {
     fn update(status: OrderStatus, filled: u64) -> Result<OrderUpdate, OrderUpdateError> {
         OrderUpdate::new(
             Symbol::new("BTCUSDT").unwrap(),
-            ClientOrderId::new("maker-1").unwrap(),
-            ExchangeOrderId::new("42").unwrap(),
+            ClientOrderId::new(1).unwrap(),
+            ExchangeOrderId::new(42).unwrap(),
             Side::Buy,
             PriceTicks::new(100).unwrap(),
             QuantityLots::new(10).unwrap(),
             FilledLots::new(filled),
             status,
         )
+    }
+
+    #[test]
+    fn fits_in_one_cache_line() {
+        assert!(std::mem::size_of::<OrderUpdate>() <= 64);
     }
 
     #[test]

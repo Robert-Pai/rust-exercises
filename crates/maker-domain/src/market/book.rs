@@ -3,11 +3,11 @@ use thiserror::Error;
 use crate::{PriceTicks, Symbol};
 
 /// A validated best bid and best ask for one instrument.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BestBidAsk {
-    symbol: Symbol,
     bid: PriceTicks,
     ask: PriceTicks,
+    symbol: Symbol,
 }
 
 impl BestBidAsk {
@@ -55,6 +55,11 @@ mod tests {
 
     fn symbol() -> Symbol {
         Symbol::new("BTCUSDT").unwrap()
+    }
+
+    #[test]
+    fn has_compact_inline_layout() {
+        assert!(std::mem::size_of::<BestBidAsk>() <= 32);
     }
 
     #[test]

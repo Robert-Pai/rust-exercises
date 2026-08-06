@@ -12,7 +12,7 @@ pub enum RegistryState {
 }
 
 /// One accepted exchange order and the grid level it represents.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegisteredOrder {
     symbol: Symbol,
     client_order_id: ClientOrderId,
@@ -107,7 +107,7 @@ impl OrderRegistry {
             .orders
             .values()
             .find(|order| order.state == RegistryState::Active && order.level.same_order(previous))
-            .map(|order| order.client_order_id.clone());
+            .map(|order| order.client_order_id);
         let Some(client_order_id) = client_order_id else {
             return Ok(None);
         };
@@ -126,7 +126,7 @@ impl OrderRegistry {
     ) -> Result<(), RegistryError> {
         if self.orders.contains_key(ack.client_order_id()) {
             return Err(RegistryError::DuplicateClientOrderId(
-                ack.client_order_id().clone(),
+                *ack.client_order_id(),
             ));
         }
         if self.has_active_level(level) {
@@ -134,14 +134,14 @@ impl OrderRegistry {
         }
 
         let order = RegisteredOrder {
-            symbol: ack.symbol().clone(),
-            client_order_id: ack.client_order_id().clone(),
-            exchange_order_id: ack.exchange_order_id().clone(),
+            symbol: *ack.symbol(),
+            client_order_id: *ack.client_order_id(),
+            exchange_order_id: *ack.exchange_order_id(),
             level,
             status: OrderStatus::Accepted,
             state: RegistryState::Active,
         };
-        self.orders.insert(order.client_order_id.clone(), order);
+        self.orders.insert(order.client_order_id, order);
         Ok(())
     }
 
@@ -162,7 +162,7 @@ impl OrderRegistry {
             ))
         {
             return Err(RegistryError::UpdateIdentityMismatch {
-                client_order_id: update.client_order_id().clone(),
+                client_order_id: *update.client_order_id(),
             });
         }
         Ok(Some(order.level))
@@ -190,7 +190,7 @@ impl OrderRegistry {
         let order = self
             .orders
             .get_mut(client_order_id)
-            .ok_or_else(|| RegistryError::UnknownOrder(client_order_id.clone()))?;
+            .ok_or(RegistryError::UnknownOrder(*client_order_id))?;
         order.status = OrderStatus::Canceled;
         order.state = RegistryState::Terminal;
         Ok(())
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn terminal_orders_stop_counting_as_live() {
         let symbol = Symbol::new("BTCUSDT").unwrap();
-        let client_order_id = ClientOrderId::new("mk-1").unwrap();
+        let client_order_id = ClientOrderId::new(1).unwrap();
         let level = GridLevel::new(
             Side::Buy,
             PriceTicks::new(100).unwrap(),
@@ -240,11 +240,7 @@ mod tests {
         registry
             .register(
                 level,
-                PlaceOrderAck::new(
-                    symbol,
-                    client_order_id.clone(),
-                    ExchangeOrderId::new("1").unwrap(),
-                ),
+                PlaceOrderAck::new(symbol, client_order_id, ExchangeOrderId::new(1).unwrap()),
             )
             .unwrap();
 

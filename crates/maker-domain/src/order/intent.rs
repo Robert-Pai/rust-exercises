@@ -7,13 +7,13 @@ pub enum ExecutionPolicy {
 }
 
 /// A validated request to create one limit order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderIntent {
-    symbol: Symbol,
-    client_order_id: ClientOrderId,
-    side: Side,
     price: PriceTicks,
     quantity: QuantityLots,
+    client_order_id: ClientOrderId,
+    symbol: Symbol,
+    side: Side,
     execution: ExecutionPolicy,
 }
 

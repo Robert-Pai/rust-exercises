@@ -18,14 +18,17 @@ pub enum ValueError {
     #[error("symbol cannot be empty")]
     EmptySymbol,
 
-    #[error("symbol cannot have leading or trailing whitespace: {0:?}")]
-    SymbolWhitespace(String),
+    #[error("symbol cannot have leading or trailing whitespace")]
+    SymbolWhitespace,
 
-    #[error("{kind} cannot be empty")]
-    EmptyIdentifier { kind: &'static str },
+    #[error("symbol must contain only ASCII characters")]
+    NonAsciiSymbol,
 
-    #[error("{kind} cannot have leading or trailing whitespace")]
-    IdentifierWhitespace { kind: &'static str },
+    #[error("symbol length {length} exceeds maximum {maximum}")]
+    SymbolTooLong { length: usize, maximum: usize },
+
+    #[error("{kind} must be greater than zero")]
+    ZeroIdentifier { kind: &'static str },
 
     #[error("price ticks must be greater than zero")]
     ZeroPrice,

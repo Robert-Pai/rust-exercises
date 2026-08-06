@@ -178,8 +178,8 @@ impl MockExchange {
             .find(|order| order.intent.side() == side && order.intent.price().get() == price)
             .expect("requested accepted order");
         OrderUpdate::new(
-            order.intent.symbol().clone(),
-            order.intent.client_order_id().clone(),
+            *order.intent.symbol(),
+            *order.intent.client_order_id(),
             order.exchange_order_id,
             order.intent.side(),
             order.intent.price(),
@@ -204,8 +204,8 @@ impl MockExchange {
             .find(|order| order.intent.side() == side && order.intent.price().get() == price)
             .expect("requested accepted order");
         OrderUpdate::new(
-            order.intent.symbol().clone(),
-            order.intent.client_order_id().clone(),
+            *order.intent.symbol(),
+            *order.intent.client_order_id(),
             order.exchange_order_id,
             order.intent.side(),
             order.intent.price(),
@@ -292,7 +292,7 @@ impl MarketDataPort for MockExchange {
     async fn best_bid_ask(&self, symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
         self.record(Action::BestBook);
         Ok(BestBidAsk::new(
-            symbol.clone(),
+            *symbol,
             PriceTicks::new(99).unwrap(),
             PriceTicks::new(101).unwrap(),
         )
@@ -320,12 +320,11 @@ impl TradingPort for MockExchange {
                 return Err(error);
             }
 
-            let exchange_order_id =
-                ExchangeOrderId::new(state.next_exchange_order_id.to_string()).unwrap();
+            let exchange_order_id = ExchangeOrderId::new(state.next_exchange_order_id).unwrap();
             state.next_exchange_order_id += 1;
             state.accepted.push(AcceptedOrder {
-                intent: intent.clone(),
-                exchange_order_id: exchange_order_id.clone(),
+                intent,
+                exchange_order_id,
             });
             exchange_order_id
         };
@@ -341,8 +340,8 @@ impl TradingPort for MockExchange {
             gate.acquire().await.unwrap().forget();
         }
         Ok(PlaceOrderAck::new(
-            intent.symbol().clone(),
-            intent.client_order_id().clone(),
+            *intent.symbol(),
+            *intent.client_order_id(),
             exchange_order_id,
         ))
     }
@@ -352,7 +351,7 @@ impl TradingPort for MockExchange {
         _symbol: &Symbol,
         client_order_id: &ClientOrderId,
     ) -> ExchangeResult<CancelOutcome> {
-        self.record(Action::Cancel(client_order_id.clone()));
+        self.record(Action::Cancel(*client_order_id));
         let gate = self
             .blocked_cancels
             .lock()
@@ -543,7 +542,7 @@ async fn late_fill_of_retired_quote_is_processed_before_cancel_completion() {
         .into_iter()
         .find(|order| order.intent.side() == Side::Buy && order.intent.price().get() == 97)
         .expect("initial far bid");
-    let cancel_gate = exchange.block_cancel(far_bid.intent.client_order_id().clone());
+    let cancel_gate = exchange.block_cancel(*far_bid.intent.client_order_id());
 
     exchange.send_book(102, 103);
     exchange.send_order_update(exchange.update_for(Side::Sell, 102, OrderStatus::Filled, 2));
@@ -571,7 +570,7 @@ async fn hanging_cancel_does_not_delay_opposite_replacement() {
         .into_iter()
         .find(|order| order.intent.side() == Side::Buy && order.intent.price().get() == 97)
         .unwrap();
-    let cancel_gate = exchange.block_cancel(far_bid.intent.client_order_id().clone());
+    let cancel_gate = exchange.block_cancel(*far_bid.intent.client_order_id());
 
     exchange.send_book(101, 102);
     exchange.send_order_update(exchange.update_for(Side::Sell, 101, OrderStatus::Filled, 2));
@@ -687,7 +686,7 @@ async fn duplicate_full_fill_is_idempotent() {
     let update = exchange.update_for(Side::Sell, 101, OrderStatus::Filled, 2);
 
     exchange.send_book(101, 102);
-    exchange.send_order_update(update.clone());
+    exchange.send_order_update(update);
     exchange.send_order_update(update);
     exchange.wait_for_accepted(8).await;
     sleep(Duration::from_millis(60)).await;

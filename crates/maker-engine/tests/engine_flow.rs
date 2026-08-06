@@ -50,7 +50,7 @@ impl MockExchange {
     ) {
         let symbol = Symbol::new("BTCUSDT").unwrap();
         let spec = InstrumentSpec::new(
-            symbol.clone(),
+            symbol,
             MarketKind::LinearPerpetual,
             Decimal::ONE,
             Decimal::new(1, 3),
@@ -59,7 +59,7 @@ impl MockExchange {
         )
         .unwrap();
         let book = BestBidAsk::new(
-            symbol.clone(),
+            symbol,
             PriceTicks::new(99).unwrap(),
             PriceTicks::new(100).unwrap(),
         )
@@ -127,7 +127,7 @@ impl InstrumentPort for MockExchange {
 #[async_trait]
 impl MarketDataPort for MockExchange {
     async fn best_bid_ask(&self, _symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
-        Ok(self.book.clone())
+        Ok(self.book)
     }
 
     async fn subscribe_best_bid_ask(
@@ -147,19 +147,15 @@ impl MarketDataPort for MockExchange {
 #[async_trait]
 impl TradingPort for MockExchange {
     async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
-        let exchange_order_id = ExchangeOrderId::new(
-            self.next_order_id
-                .fetch_add(1, Ordering::Relaxed)
-                .to_string(),
-        )
-        .unwrap();
+        let exchange_order_id =
+            ExchangeOrderId::new(self.next_order_id.fetch_add(1, Ordering::Relaxed)).unwrap();
         self.calls.lock().unwrap().push(Call::Place {
-            intent: intent.clone(),
-            exchange_order_id: exchange_order_id.clone(),
+            intent,
+            exchange_order_id,
         });
         Ok(PlaceOrderAck::new(
-            self.symbol.clone(),
-            intent.client_order_id().clone(),
+            self.symbol,
+            *intent.client_order_id(),
             exchange_order_id,
         ))
     }
@@ -170,7 +166,7 @@ impl TradingPort for MockExchange {
         client_order_id: &ClientOrderId,
     ) -> ExchangeResult<CancelOutcome> {
         self.calls.lock().unwrap().push(Call::Cancel {
-            client_order_id: client_order_id.clone(),
+            client_order_id: *client_order_id,
         });
         Ok(CancelOutcome::Canceled)
     }
@@ -294,8 +290,8 @@ fn filled_update(
     filled: u64,
 ) -> OrderUpdate {
     OrderUpdate::new(
-        intent.symbol().clone(),
-        intent.client_order_id().clone(),
+        *intent.symbol(),
+        *intent.client_order_id(),
         exchange_order_id,
         intent.side(),
         intent.price(),
@@ -376,7 +372,7 @@ async fn full_ask_fill_cancels_far_bid_and_places_near_bid_and_far_ask() {
     let far_bid_client_id = initial
         .iter()
         .find(|(intent, _)| intent.side() == Side::Buy && intent.price().get() == 96)
-        .map(|(intent, _)| intent.client_order_id().clone())
+        .map(|(intent, _)| *intent.client_order_id())
         .unwrap();
 
     order_sender

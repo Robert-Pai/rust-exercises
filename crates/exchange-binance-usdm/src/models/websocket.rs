@@ -1,22 +1,22 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct BookTickerEventDto {
-    #[serde(rename = "s")]
-    pub(crate) symbol: String,
-    #[serde(rename = "b")]
-    pub(crate) bid_price: String,
-    #[serde(rename = "a")]
-    pub(crate) ask_price: String,
+pub(crate) struct BookTickerEventDto<'a> {
+    #[serde(borrow, rename = "s")]
+    pub(crate) symbol: &'a str,
+    #[serde(borrow, rename = "b")]
+    pub(crate) bid_price: &'a str,
+    #[serde(borrow, rename = "a")]
+    pub(crate) ask_price: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "e")]
-pub(crate) enum PrivateEventDto {
+pub(crate) enum PrivateEventDto<'a> {
     #[serde(rename = "ORDER_TRADE_UPDATE")]
     OrderTradeUpdate {
-        #[serde(rename = "o")]
-        order: OrderTradeEventDto,
+        #[serde(borrow, rename = "o")]
+        order: OrderTradeEventDto<'a>,
     },
     #[serde(rename = "listenKeyExpired")]
     ListenKeyExpired,
@@ -25,23 +25,23 @@ pub(crate) enum PrivateEventDto {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OrderTradeEventDto {
-    #[serde(rename = "s")]
-    pub(crate) symbol: String,
-    #[serde(rename = "c")]
-    pub(crate) client_order_id: String,
+pub(crate) struct OrderTradeEventDto<'a> {
+    #[serde(borrow, rename = "s")]
+    pub(crate) symbol: &'a str,
+    #[serde(borrow, rename = "c")]
+    pub(crate) client_order_id: &'a str,
     #[serde(rename = "i")]
     pub(crate) order_id: u64,
-    #[serde(rename = "S")]
-    pub(crate) side: String,
-    #[serde(rename = "o")]
-    pub(crate) order_type: String,
-    #[serde(rename = "p")]
-    pub(crate) price: String,
-    #[serde(rename = "q")]
-    pub(crate) original_quantity: String,
-    #[serde(rename = "z")]
-    pub(crate) cumulative_filled: String,
-    #[serde(rename = "X")]
-    pub(crate) status: String,
+    #[serde(borrow, rename = "S")]
+    pub(crate) side: &'a str,
+    #[serde(borrow, rename = "o")]
+    pub(crate) order_type: &'a str,
+    #[serde(borrow, rename = "p")]
+    pub(crate) price: &'a str,
+    #[serde(borrow, rename = "q")]
+    pub(crate) original_quantity: &'a str,
+    #[serde(borrow, rename = "z")]
+    pub(crate) cumulative_filled: &'a str,
+    #[serde(borrow, rename = "X")]
+    pub(crate) status: &'a str,
 }

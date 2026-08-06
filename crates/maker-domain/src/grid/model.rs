@@ -41,7 +41,7 @@ impl GridModel {
         }
 
         let model = Self {
-            symbol: book.symbol().clone(),
+            symbol: *book.symbol(),
             config,
             bids,
             asks,

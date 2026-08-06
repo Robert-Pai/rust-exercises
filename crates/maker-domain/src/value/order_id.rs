@@ -2,35 +2,52 @@ use std::fmt;
 
 use super::ValueError;
 
-macro_rules! identifier {
+macro_rules! numeric_identifier {
     ($name:ident, $kind:literal) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(String);
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(u64);
 
         impl $name {
-            pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
-                let value = value.into();
-                if value.is_empty() {
-                    return Err(ValueError::EmptyIdentifier { kind: $kind });
-                }
-                if value.trim() != value {
-                    return Err(ValueError::IdentifierWhitespace { kind: $kind });
+            pub const fn new(value: u64) -> Result<Self, ValueError> {
+                if value == 0 {
+                    return Err(ValueError::ZeroIdentifier { kind: $kind });
                 }
                 Ok(Self(value))
             }
 
-            pub fn as_str(&self) -> &str {
-                &self.0
+            pub const fn get(self) -> u64 {
+                self.0
             }
         }
 
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
+                self.0.fmt(formatter)
             }
         }
     };
 }
 
-identifier!(ClientOrderId, "client order ID");
-identifier!(ExchangeOrderId, "exchange order ID");
+numeric_identifier!(ClientOrderId, "client order ID");
+numeric_identifier!(ExchangeOrderId, "exchange order ID");
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::*;
+
+    #[test]
+    fn identifiers_are_compact_numeric_values() {
+        assert_eq!(size_of::<ClientOrderId>(), 8);
+        assert_eq!(size_of::<ExchangeOrderId>(), 8);
+        assert_eq!(ClientOrderId::new(42).unwrap().to_string(), "42");
+        assert_eq!(ExchangeOrderId::new(7).unwrap().get(), 7);
+    }
+
+    #[test]
+    fn rejects_zero_identifiers() {
+        assert!(ClientOrderId::new(0).is_err());
+        assert!(ExchangeOrderId::new(0).is_err());
+    }
+}
