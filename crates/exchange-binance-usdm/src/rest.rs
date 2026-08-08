@@ -16,6 +16,10 @@ use crate::{
         ApiErrorDto, BookTickerDto, DualSidePositionDto, ExchangeInfoDto, ExchangeSymbolDto,
         ListenKeyDto, ServerTimeDto,
     },
+    rate_limit::{
+        AcquireDecision, RateLimitSnapshot, RequestCost, RequestRateLimiter,
+        SharedRequestRateLimiter,
+    },
     signing::{build_signed_query, encode_query},
 };
 
@@ -31,6 +35,8 @@ struct RestInner {
     base_url: String,
     credentials: BinanceCredentials,
     recv_window_ms: u64,
+    request_timeout: Duration,
+    request_rate_limiter: SharedRequestRateLimiter,
 }
 
 impl RestClient {
@@ -56,6 +62,8 @@ impl RestClient {
                 base_url: config.rest_url().trim_end_matches('/').to_owned(),
                 credentials,
                 recv_window_ms,
+                request_timeout: config.request_timeout(),
+                request_rate_limiter: RequestRateLimiter::shared(),
             }),
         })
     }
@@ -64,9 +72,34 @@ impl RestClient {
         &self,
         symbol: &Symbol,
     ) -> ExchangeResult<ExchangeSymbolDto> {
+        let limit_version =
+            RequestRateLimiter::begin_limit_refresh(&self.inner.request_rate_limiter)?;
         let response: ExchangeInfoDto = self
             .public_json(Method::GET, "/fapi/v1/exchangeInfo", Vec::new())
             .await?;
+        let snapshots = response
+            .rate_limits
+            .iter()
+            .filter_map(|limit| {
+                RateLimitSnapshot::from_wire(
+                    &limit.rate_limit_type,
+                    &limit.interval,
+                    limit.interval_num,
+                    limit.limit,
+                    limit.count,
+                )
+            })
+            .collect::<Vec<_>>();
+        if snapshots.len() != response.rate_limits.len() {
+            return Err(RequestRateLimiter::reject_unrecognized_telemetry(
+                &self.inner.request_rate_limiter,
+            ));
+        }
+        RequestRateLimiter::update_limits(
+            &self.inner.request_rate_limiter,
+            limit_version,
+            &snapshots,
+        )?;
         response
             .symbols
             .into_iter()
@@ -77,6 +110,10 @@ impl RestClient {
                     format!("Binance USD-M symbol {symbol} was not found"),
                 )
             })
+    }
+
+    pub(crate) fn request_rate_limiter(&self) -> SharedRequestRateLimiter {
+        self.inner.request_rate_limiter.clone()
     }
 
     pub(crate) async fn book_ticker(&self, symbol: &Symbol) -> ExchangeResult<BookTickerDto> {
@@ -136,7 +173,7 @@ impl RestClient {
     {
         let query = encode_query(&parameters);
         let url = self.endpoint_with_query(path, &query);
-        self.execute_json(self.inner.http.request(method, url))
+        self.execute_json(self.inner.http.request(method, url), RequestCost::GENERIC)
             .await
     }
 
@@ -151,10 +188,13 @@ impl RestClient {
     {
         let query = encode_query(&parameters);
         let url = self.endpoint_with_query(path, &query);
-        self.execute_json(self.inner.http.request(method, url).header(
-            API_KEY_HEADER,
-            self.inner.credentials.api_key().expose_secret(),
-        ))
+        self.execute_json(
+            self.inner.http.request(method, url).header(
+                API_KEY_HEADER,
+                self.inner.credentials.api_key().expose_secret(),
+            ),
+            RequestCost::GENERIC,
+        )
         .await
     }
 
@@ -184,7 +224,7 @@ impl RestClient {
                     API_KEY_HEADER,
                     self.inner.credentials.api_key().expose_secret(),
                 );
-            match self.execute_json(request).await {
+            match self.execute_json(request, RequestCost::GENERIC).await {
                 Err(error) if attempt == 0 && error.exchange_code() == Some("-1021") => {
                     clock_offset_ms = self.clock_offset_ms().await?;
                 }
@@ -229,12 +269,23 @@ impl RestClient {
         }
     }
 
-    async fn execute_json<T>(&self, request: RequestBuilder) -> ExchangeResult<T>
+    async fn execute_json<T>(&self, request: RequestBuilder, cost: RequestCost) -> ExchangeResult<T>
     where
         T: DeserializeOwned,
     {
+        self.acquire_request_capacity(cost).await?;
         let response = request.send().await.map_err(error::transport)?;
         let status = response.status();
+        let header_snapshots = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                crate::rate_limit::rest_header_snapshot(
+                    &name.as_str().to_ascii_uppercase(),
+                    value.to_str().ok()?,
+                )
+            })
+            .collect::<Vec<_>>();
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -242,9 +293,15 @@ impl RestClient {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
         let body = response.bytes().await.map_err(error::transport)?;
+        RequestRateLimiter::update_counts(&self.inner.request_rate_limiter, &header_snapshots)?;
         if status.is_success() {
-            return serde_json::from_slice(&body)
+            let result = serde_json::from_slice(&body)
                 .map_err(|error| error::invalid_response("JSON response", error));
+            RequestRateLimiter::observe_error(
+                &self.inner.request_rate_limiter,
+                result.as_ref().err(),
+            )?;
+            return result;
         }
 
         let api_error: ApiErrorDto = serde_json::from_slice(&body).map_err(|decode_error| {
@@ -255,8 +312,28 @@ impl RestClient {
                 ),
             )
         })?;
-        Err(error::api(status, api_error, retry_after))
+        let error = error::api(status, api_error, retry_after);
+        RequestRateLimiter::observe_error(&self.inner.request_rate_limiter, Some(&error))?;
+        Err(error)
     }
+
+    async fn acquire_request_capacity(&self, cost: RequestCost) -> ExchangeResult<()> {
+        let deadline = tokio::time::Instant::now() + self.inner.request_timeout;
+        loop {
+            match RequestRateLimiter::acquire(&self.inner.request_rate_limiter, cost, deadline)? {
+                AcquireDecision::Ready => return Ok(()),
+                AcquireDecision::RetryAt(retry_at) => tokio::time::sleep_until(retry_at).await,
+                AcquireDecision::DeadlineExceeded => return Err(rate_limit_timeout_error()),
+            }
+        }
+    }
+}
+
+fn rate_limit_timeout_error() -> ExchangeError {
+    ExchangeError::new(
+        ExchangeErrorKind::Timeout,
+        "Binance request rate-limit wait exceeded its deadline",
+    )
 }
 
 fn signed_timestamp_ms(clock_offset_ms: i64) -> ExchangeResult<u64> {

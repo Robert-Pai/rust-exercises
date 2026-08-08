@@ -5,6 +5,20 @@ pub(crate) struct ApiErrorDto {
     pub(crate) code: i64,
     #[serde(rename = "msg")]
     pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RateLimitDto {
+    #[serde(rename = "rateLimitType")]
+    pub(crate) rate_limit_type: String,
+    pub(crate) interval: String,
+    pub(crate) interval_num: u64,
+    pub(crate) limit: u64,
+    #[serde(default)]
+    pub(crate) count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16,6 +30,8 @@ pub(crate) struct ServerTimeDto {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExchangeInfoDto {
     pub(crate) symbols: Vec<ExchangeSymbolDto>,
+    #[serde(default, rename = "rateLimits")]
+    pub(crate) rate_limits: Vec<RateLimitDto>,
 }
 
 #[derive(Debug, Deserialize)]

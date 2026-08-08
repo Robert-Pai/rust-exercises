@@ -13,8 +13,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
     error,
-    models::{ApiErrorDto, WsApiCancelAllDto, WsApiOrderAckDto, WsApiOrderDto},
+    models::{ApiErrorDto, RateLimitDto, WsApiCancelAllDto, WsApiOrderAckDto, WsApiOrderDto},
     network::NetworkRuntime,
+    rate_limit::{
+        AcquireDecision, RateLimitSnapshot, RequestCost, RequestRateLimiter,
+        SharedRequestRateLimiter,
+    },
     rest::RestClient,
     signing::sign_payload,
 };
@@ -29,7 +33,7 @@ const TRANSPORT_ID_MASK: u64 = (TRANSPORT_ID_SLOTS as u64) - 1;
 /// Move-only strategy-side producer for one persistent trading WebSocket worker.
 pub(crate) struct WsApiClient {
     commands: SpscProducer<Command>,
-    response_timeout: Duration,
+    queue_timeout: Duration,
 }
 
 struct WorkerConfig {
@@ -39,6 +43,7 @@ struct WorkerConfig {
     recv_window_ms: u64,
     connect_timeout: Duration,
     response_timeout: Duration,
+    request_rate_limiter: SharedRequestRateLimiter,
 }
 
 struct WorkerState {
@@ -73,8 +78,16 @@ struct PendingRequest {
 
 type PendingSlots = [Option<PendingRequest>; TRANSPORT_ID_SLOTS];
 
+struct DeferredCommand {
+    command: Command,
+    retry_at: tokio::time::Instant,
+}
+
+type DeferredSlots = [Option<DeferredCommand>; TRANSPORT_ID_SLOTS];
+
 enum DispatchOutcome {
     Continue,
+    Deferred(DeferredCommand),
     Reset(ExchangeError),
 }
 
@@ -86,6 +99,8 @@ struct WsApiResponse {
     result: Option<Value>,
     #[serde(default)]
     error: Option<ApiErrorDto>,
+    #[serde(default, rename = "rateLimits")]
+    rate_limits: Vec<RateLimitDto>,
 }
 
 impl WsApiClient {
@@ -103,6 +118,8 @@ impl WsApiClient {
             )
         })?;
         let (commands, receiver) = spsc_channel(COMMAND_BUFFER);
+        let queue_timeout = queue_timeout(config.request_timeout());
+        let request_rate_limiter = clock.request_rate_limiter();
         network.spawn(run_worker(
             WorkerConfig {
                 endpoint: config.websocket_api_url().to_owned(),
@@ -111,12 +128,13 @@ impl WsApiClient {
                 recv_window_ms,
                 connect_timeout: config.request_timeout(),
                 response_timeout: config.request_timeout(),
+                request_rate_limiter,
             },
             receiver,
         ))?;
         Ok(Self {
             commands,
-            response_timeout: config.request_timeout(),
+            queue_timeout,
         })
     }
 
@@ -235,7 +253,7 @@ impl WsApiClient {
             parameters,
             mode,
             clock_retried: false,
-            deadline: tokio::time::Instant::now() + self.response_timeout,
+            deadline: tokio::time::Instant::now() + self.queue_timeout,
             reply,
         };
         if let Err(error) = self.commands.try_push(command) {
@@ -272,6 +290,7 @@ fn command_enqueue_error(error: TryPushError<Command>) -> ExchangeError {
 async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
     let mut socket = None;
     let mut pending: PendingSlots = std::array::from_fn(|_| None);
+    let mut deferred: DeferredSlots = std::array::from_fn(|_| None);
     let mut next_request_id = 1_u64;
     let mut state = WorkerState {
         clock_offset_ms: None,
@@ -300,12 +319,22 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                         &mut next_request_id,
                         &config,
                         &mut state,
+                        &config.request_rate_limiter,
                         command,
                     )
                     .await
                     {
                         DispatchOutcome::Continue => socket = Some(connected),
-                        DispatchOutcome::Reset(error) => fail_pending(&mut pending, error),
+                        DispatchOutcome::Deferred(command) => {
+                            if let Some(error) = defer_command(&mut deferred, command) {
+                                fail_worker(&mut pending, &mut deferred, error);
+                            } else {
+                                socket = Some(connected);
+                            }
+                        }
+                        DispatchOutcome::Reset(error) => {
+                            fail_worker(&mut pending, &mut deferred, error);
+                        }
                     }
                 }
                 Err(error) => {
@@ -318,12 +347,14 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
         let connected = socket
             .as_mut()
             .expect("WebSocket API socket was checked above");
-        let deadline = next_pending_deadline(&pending);
+        let deadline = next_worker_deadline(&pending, &deferred);
+        let retry_at = next_deferred_retry(&deferred);
         tokio::select! {
-            command = commands.recv(), if pending_count(&pending) < TRANSPORT_ID_SLOTS => {
+            command = commands.recv(), if active_count(&pending, &deferred) < TRANSPORT_ID_SLOTS => {
                 let Some(command) = command else {
-                    fail_pending(
+                    fail_worker(
                         &mut pending,
+                        &mut deferred,
                         ExchangeError::new(
                             ExchangeErrorKind::ServiceUnavailable,
                             "Binance WebSocket API worker stopped",
@@ -335,15 +366,17 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     finish_inactive(command);
                     continue;
                 }
-                if let DispatchOutcome::Reset(error) = dispatch(
+                let outcome = dispatch(
                     connected,
                     &mut pending,
                     &mut next_request_id,
                     &config,
                     &mut state,
+                    &config.request_rate_limiter,
                     command,
-                ).await {
-                    fail_pending(&mut pending, error);
+                ).await;
+                if let Some(error) = apply_dispatch_outcome(&mut deferred, outcome) {
+                    fail_worker(&mut pending, &mut deferred, error);
                     socket = None;
                 }
             }
@@ -354,15 +387,40 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     &mut next_request_id,
                     &config,
                     &mut state,
-                    write_timeout(deadline, config.response_timeout),
+                    &mut deferred,
                     message,
                 ).await {
-                    fail_pending(&mut pending, error);
+                    fail_worker(&mut pending, &mut deferred, error);
+                    socket = None;
+                }
+            }
+            () = wait_for_deadline(retry_at) => {
+                let now = tokio::time::Instant::now();
+                let Some(command) = take_due_deferred(&mut deferred, now) else {
+                    continue;
+                };
+                if command_is_inactive(&command) {
+                    finish_inactive(command);
+                    continue;
+                }
+                let outcome = dispatch(
+                    connected,
+                    &mut pending,
+                    &mut next_request_id,
+                    &config,
+                    &mut state,
+                    &config.request_rate_limiter,
+                    command,
+                ).await;
+                if let Some(error) = apply_dispatch_outcome(&mut deferred, outcome) {
+                    fail_worker(&mut pending, &mut deferred, error);
                     socket = None;
                 }
             }
             () = wait_for_deadline(deadline) => {
-                expire_pending(&mut pending, tokio::time::Instant::now());
+                let now = tokio::time::Instant::now();
+                expire_pending(&mut pending, now);
+                expire_deferred(&mut deferred, now);
             }
         }
     }
@@ -384,6 +442,20 @@ fn remaining(deadline: tokio::time::Instant) -> Option<Duration> {
         .filter(|remaining| !remaining.is_zero())
 }
 
+fn queue_timeout(response_timeout: Duration) -> Duration {
+    let queue_budget = Duration::from_secs(120);
+    response_timeout
+        .checked_add(queue_budget)
+        .unwrap_or(Duration::MAX)
+}
+
+fn request_cost(method: &str) -> RequestCost {
+    match method {
+        "order.place" | "order.cancel" | "openOrders.cancelAll" => RequestCost::ORDER,
+        _ => RequestCost::GENERIC,
+    }
+}
+
 fn write_timeout(deadline: Option<tokio::time::Instant>, fallback: Duration) -> Duration {
     deadline
         .and_then(remaining)
@@ -403,13 +475,14 @@ async fn dispatch(
     next_request_id: &mut u64,
     config: &WorkerConfig,
     state: &mut WorkerState,
+    request_rate_limiter: &SharedRequestRateLimiter,
     command: Command,
 ) -> DispatchOutcome {
-    let deadline = command.deadline;
+    let queue_deadline = command.deadline;
     if command.reply.is_closed() {
         return DispatchOutcome::Continue;
     }
-    if remaining(deadline).is_none() {
+    if remaining(queue_deadline).is_none() {
         let _ = command.reply.send(Err(response_timeout_error()));
         return DispatchOutcome::Continue;
     }
@@ -429,10 +502,37 @@ async fn dispatch(
     if command.reply.is_closed() {
         return DispatchOutcome::Continue;
     }
-    if remaining(deadline).is_none() {
+    if remaining(queue_deadline).is_none() {
         let _ = command.reply.send(Err(response_timeout_error()));
         return DispatchOutcome::Continue;
     }
+
+    match RequestRateLimiter::acquire(
+        request_rate_limiter,
+        request_cost(command.method),
+        queue_deadline,
+    ) {
+        Ok(AcquireDecision::Ready) => {}
+        Ok(AcquireDecision::RetryAt(retry_at)) => {
+            return DispatchOutcome::Deferred(DeferredCommand { command, retry_at });
+        }
+        Ok(AcquireDecision::DeadlineExceeded) => {
+            let _ = command.reply.send(Err(response_timeout_error()));
+            return DispatchOutcome::Continue;
+        }
+        Err(error) => {
+            let _ = command.reply.send(Err(error));
+            return DispatchOutcome::Continue;
+        }
+    }
+
+    // Initial commands use a queue-inclusive deadline. Retries carry the
+    // original in-flight request deadline, so taking the earlier instant
+    // preserves the existing retry timeout semantics.
+    let deadline = std::cmp::min(
+        queue_deadline,
+        tokio::time::Instant::now() + config.response_timeout,
+    );
 
     let id = next_transport_id(next_request_id);
     let slot = transport_slot(id);
@@ -515,7 +615,7 @@ async fn handle_message(
     next_request_id: &mut u64,
     config: &WorkerConfig,
     state: &mut WorkerState,
-    write_timeout: Duration,
+    deferred: &mut DeferredSlots,
     message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
 ) -> Option<ExchangeError> {
     match message {
@@ -526,6 +626,29 @@ async fn handle_message(
                     return Some(error::invalid_response("WebSocket API response", error));
                 }
             };
+            let snapshots = response
+                .rate_limits
+                .iter()
+                .filter_map(|limit| {
+                    RateLimitSnapshot::from_wire(
+                        &limit.rate_limit_type,
+                        &limit.interval,
+                        limit.interval_num,
+                        limit.limit,
+                        limit.count,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if snapshots.len() != response.rate_limits.len() {
+                return Some(RequestRateLimiter::reject_unrecognized_telemetry(
+                    &config.request_rate_limiter,
+                ));
+            }
+            if let Err(error) =
+                RequestRateLimiter::update_counts(&config.request_rate_limiter, &snapshots)
+            {
+                return Some(error);
+            }
             let request = take_pending(pending, response.id)?;
             if request.reply.is_closed() {
                 return None;
@@ -572,9 +695,17 @@ async fn handle_message(
                     deadline: request.deadline,
                     reply: request.reply,
                 };
-                if let DispatchOutcome::Reset(error) =
-                    dispatch(socket, pending, next_request_id, config, state, command).await
-                {
+                let outcome = dispatch(
+                    socket,
+                    pending,
+                    next_request_id,
+                    config,
+                    state,
+                    &config.request_rate_limiter,
+                    command,
+                )
+                .await;
+                if let Some(error) = apply_dispatch_outcome(deferred, outcome) {
                     return Some(error);
                 }
                 return None;
@@ -593,9 +724,17 @@ async fn handle_message(
                     deadline: request.deadline,
                     reply: request.reply,
                 };
-                if let DispatchOutcome::Reset(error) =
-                    dispatch(socket, pending, next_request_id, config, state, command).await
-                {
+                let outcome = dispatch(
+                    socket,
+                    pending,
+                    next_request_id,
+                    config,
+                    state,
+                    &config.request_rate_limiter,
+                    command,
+                )
+                .await;
+                if let Some(error) = apply_dispatch_outcome(deferred, outcome) {
                     return Some(error);
                 }
                 return None;
@@ -629,10 +768,21 @@ async fn handle_message(
                     ),
                 ))
             };
+            if let Err(error) = RequestRateLimiter::observe_error(
+                &config.request_rate_limiter,
+                result.as_ref().err(),
+            ) {
+                let _ = request.reply.send(Err(error.clone()));
+                return Some(error);
+            }
             let _ = request.reply.send(result);
             None
         }
         Some(Ok(Message::Ping(payload))) => {
+            let write_timeout = write_timeout(
+                next_worker_deadline(pending, deferred),
+                config.response_timeout,
+            );
             match tokio::time::timeout(write_timeout, socket.send(Message::Pong(payload))).await {
                 Ok(Ok(())) => None,
                 Ok(Err(_)) => Some(ExchangeError::new(
@@ -683,6 +833,60 @@ fn pending_count(pending: &PendingSlots) -> usize {
     pending.iter().filter(|slot| slot.is_some()).count()
 }
 
+fn deferred_count(deferred: &DeferredSlots) -> usize {
+    deferred.iter().filter(|slot| slot.is_some()).count()
+}
+
+fn active_count(pending: &PendingSlots, deferred: &DeferredSlots) -> usize {
+    pending_count(pending) + deferred_count(deferred)
+}
+
+fn apply_dispatch_outcome(
+    deferred: &mut DeferredSlots,
+    outcome: DispatchOutcome,
+) -> Option<ExchangeError> {
+    match outcome {
+        DispatchOutcome::Continue => None,
+        DispatchOutcome::Deferred(command) => defer_command(deferred, command),
+        DispatchOutcome::Reset(error) => Some(error),
+    }
+}
+
+fn defer_command(deferred: &mut DeferredSlots, command: DeferredCommand) -> Option<ExchangeError> {
+    if let Some(slot) = deferred.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(command);
+        return None;
+    }
+
+    let error = ExchangeError::new(
+        ExchangeErrorKind::StateConflict,
+        "Binance WebSocket API deferred-command capacity was exhausted",
+    );
+    let _ = command.command.reply.send(Err(error.clone()));
+    Some(error)
+}
+
+fn next_deferred_retry(deferred: &DeferredSlots) -> Option<tokio::time::Instant> {
+    deferred
+        .iter()
+        .filter_map(|slot| slot.as_ref().map(|command| command.retry_at))
+        .min()
+}
+
+fn take_due_deferred(deferred: &mut DeferredSlots, now: tokio::time::Instant) -> Option<Command> {
+    let index = deferred
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            slot.as_ref()
+                .filter(|command| command.retry_at <= now)
+                .map(|command| (index, command.retry_at))
+        })
+        .min_by_key(|(_, retry_at)| *retry_at)
+        .map(|(index, _)| index)?;
+    deferred[index].take().map(|command| command.command)
+}
+
 fn transport_slot(id: u64) -> usize {
     usize::try_from(id & TRANSPORT_ID_MASK).expect("transport slot fits usize")
 }
@@ -706,11 +910,38 @@ fn next_pending_deadline(pending: &PendingSlots) -> Option<tokio::time::Instant>
         .min()
 }
 
+fn next_worker_deadline(
+    pending: &PendingSlots,
+    deferred: &DeferredSlots,
+) -> Option<tokio::time::Instant> {
+    let pending = next_pending_deadline(pending);
+    let deferred = deferred
+        .iter()
+        .filter_map(|slot| slot.as_ref().map(|command| command.command.deadline))
+        .min();
+    match (pending, deferred) {
+        (Some(pending), Some(deferred)) => Some(std::cmp::min(pending, deferred)),
+        (pending, deferred) => pending.or(deferred),
+    }
+}
+
 fn expire_pending(pending: &mut PendingSlots, now: tokio::time::Instant) {
     for slot in pending.iter_mut() {
         if slot.as_ref().is_some_and(|request| request.deadline <= now) {
             let request = slot.take().expect("expired request slot is occupied");
             let _ = request.reply.send(Err(response_timeout_error()));
+        }
+    }
+}
+
+fn expire_deferred(deferred: &mut DeferredSlots, now: tokio::time::Instant) {
+    for slot in deferred.iter_mut() {
+        if slot
+            .as_ref()
+            .is_some_and(|command| command.command.deadline <= now)
+        {
+            let command = slot.take().expect("expired deferred slot is occupied");
+            let _ = command.command.reply.send(Err(response_timeout_error()));
         }
     }
 }
@@ -728,6 +959,19 @@ fn fail_pending(pending: &mut PendingSlots, error: ExchangeError) {
             let _ = request.reply.send(Err(error.clone()));
         }
     }
+}
+
+fn fail_deferred(deferred: &mut DeferredSlots, error: ExchangeError) {
+    for slot in deferred.iter_mut() {
+        if let Some(command) = slot.take() {
+            let _ = command.command.reply.send(Err(error.clone()));
+        }
+    }
+}
+
+fn fail_worker(pending: &mut PendingSlots, deferred: &mut DeferredSlots, error: ExchangeError) {
+    fail_pending(pending, error.clone());
+    fail_deferred(deferred, error);
 }
 
 fn signed_timestamp_ms(clock_offset_ms: i64) -> ExchangeResult<u64> {

@@ -11,6 +11,7 @@ mod error;
 mod mapping;
 mod models;
 mod network;
+mod rate_limit;
 mod rest;
 mod signing;
 mod websocket;

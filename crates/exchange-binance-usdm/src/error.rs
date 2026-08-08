@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use maker_ports::{ExchangeError, ExchangeErrorKind};
 
@@ -37,6 +37,7 @@ pub(crate) fn api(
     retry_after: Option<Duration>,
 ) -> ExchangeError {
     let kind = classify_api_error(status, error.code, &error.message);
+    let retry_after = retry_after.or_else(|| retry_after_from_error(&error));
     let mut normalized =
         ExchangeError::new(kind, error.message).with_exchange_code(error.code.to_string());
     if let Some(delay) = retry_after {
@@ -51,6 +52,20 @@ pub(crate) fn websocket_api(status: u16, error: ApiErrorDto) -> ExchangeError {
     api(status, error, None)
 }
 
+fn retry_after_from_error(error: &ApiErrorDto) -> Option<Duration> {
+    let timestamp_ms = error
+        .data
+        .as_ref()?
+        .get("retryAfter")
+        .and_then(serde_json::Value::as_u64)?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let remaining_ms = timestamp_ms.saturating_sub(u64::try_from(now_ms).ok()?);
+    Some(Duration::from_millis(remaining_ms))
+}
+
 fn classify_api_error(status: reqwest::StatusCode, code: i64, message: &str) -> ExchangeErrorKind {
     match code {
         -1022 | -2014 | -2015 => ExchangeErrorKind::Authentication,
@@ -63,7 +78,13 @@ fn classify_api_error(status: reqwest::StatusCode, code: i64, message: &str) -> 
             ExchangeErrorKind::PostOnlyWouldTake
         }
         -2010 | -2011 | -2013 => ExchangeErrorKind::ExchangeRejected,
-        _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS => ExchangeErrorKind::RateLimited,
+        _ if matches!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::IM_A_TEAPOT
+        ) =>
+        {
+            ExchangeErrorKind::RateLimited
+        }
         _ if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN =>
         {
@@ -85,6 +106,7 @@ mod tests {
             ApiErrorDto {
                 code: -2010,
                 message: "Order would immediately match and take.".to_owned(),
+                data: None,
             },
             None,
         );
@@ -100,10 +122,27 @@ mod tests {
             ApiErrorDto {
                 code: -5022,
                 message: "Due to the order could not be executed as maker.".to_owned(),
+                data: None,
             },
             None,
         );
 
         assert_eq!(error.kind(), ExchangeErrorKind::PostOnlyWouldTake);
+    }
+
+    #[test]
+    fn identifies_rate_limit_ip_ban_as_rate_limited() {
+        let error = api(
+            reqwest::StatusCode::IM_A_TEAPOT,
+            ApiErrorDto {
+                code: 0,
+                message: "Too many requests; IP banned".to_owned(),
+                data: None,
+            },
+            Some(Duration::from_secs(2)),
+        );
+
+        assert_eq!(error.kind(), ExchangeErrorKind::RateLimited);
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
     }
 }

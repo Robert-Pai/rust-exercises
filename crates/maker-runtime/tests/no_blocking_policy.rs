@@ -6,6 +6,7 @@ const COVERED_FILES: &[&str] = &[
     "crates/maker-ports/src/order_updates.rs",
     "crates/exchange-binance-usdm/src/adapter.rs",
     "crates/exchange-binance-usdm/src/network.rs",
+    "crates/exchange-binance-usdm/src/rate_limit.rs",
     "crates/exchange-binance-usdm/src/rest.rs",
     "crates/exchange-binance-usdm/src/websocket.rs",
     "crates/exchange-binance-usdm/src/ws_api.rs",

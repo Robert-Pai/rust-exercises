@@ -14,6 +14,29 @@ fn signature_payload_is_sorted_and_uses_wire_values() {
 }
 
 #[test]
+fn parses_websocket_rate_limit_telemetry() {
+    let response: WsApiResponse = serde_json::from_str(
+        r#"{
+            "id": 1,
+            "status": 200,
+            "rateLimits": [{
+                "rateLimitType": "ORDERS",
+                "interval": "SECOND",
+                "intervalNum": 10,
+                "limit": 100,
+                "count": 3
+            }],
+            "result": {}
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(response.rate_limits.len(), 1);
+    assert_eq!(response.rate_limits[0].interval_num, 10);
+    assert_eq!(response.rate_limits[0].count, Some(3));
+}
+
+#[test]
 fn signature_payload_rejects_nested_values() {
     let parameters = Parameters::from([("bad".to_owned(), json!({"nested": true}))]);
 
@@ -48,7 +71,7 @@ fn request_deadline_is_assigned_synchronously_before_enqueue() {
     let (commands, mut receiver) = spsc_channel(1);
     let mut client = WsApiClient {
         commands,
-        response_timeout: Duration::from_millis(250),
+        queue_timeout: Duration::from_millis(250),
     };
     let before = tokio::time::Instant::now();
     let response = client.request_value("order.status", Parameters::new(), ResponseMode::Direct);
@@ -284,6 +307,103 @@ async fn worker_owns_response_timeout_and_reuses_connection_after_cleanup() {
     assert_eq!(first.kind(), ExchangeErrorKind::Timeout);
     let second = client.query_order(&symbol, &client_order_id).await.unwrap();
     assert_eq!(second.status, "NEW");
+
+    http_server.await.unwrap();
+    ws_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn deferred_rate_limited_command_does_not_block_inbound_responses() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_address = http_listener.local_addr().unwrap();
+    let http_server = tokio::spawn(serve_time_once(http_listener));
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_address = ws_listener.local_addr().unwrap();
+    let (first_seen, first_received) = tokio::sync::oneshot::channel();
+    let ws_server = tokio::spawn(async move {
+        let (connection, _) = ws_listener.accept().await.unwrap();
+        let mut socket = accept_async(connection).await.unwrap();
+        let Message::Text(first) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected first request");
+        };
+        let first: Value = serde_json::from_str(first.as_ref()).unwrap();
+        first_seen.send(()).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "rate-limited command was sent before its retry instant"
+        );
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": first["id"],
+                    "status": 200,
+                    "result": order_result("NEW", "0.000")
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let Message::Text(second) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected deferred request");
+        };
+        let second: Value = serde_json::from_str(second.as_ref()).unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": second["id"],
+                    "status": 200,
+                    "result": order_result("NEW", "0.000")
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let config = test_config(http_address, ws_address, Duration::from_secs(2));
+    let credentials = test_credentials();
+    let rest = RestClient::new(&config, credentials.clone()).unwrap();
+    let limiter = rest.request_rate_limiter();
+    let mut network = NetworkRuntime::new(crate::network::NetworkRole::Trading, &config).unwrap();
+    let mut client = WsApiClient::new(&config, credentials, rest, &mut network).unwrap();
+    let symbol = Symbol::new("BTCUSDT").unwrap();
+    let client_order_id = ClientOrderId::new(1).unwrap();
+
+    let first = client.query_order(&symbol, &client_order_id);
+    first_received.await.unwrap();
+    RequestRateLimiter::observe_error(
+        &limiter,
+        Some(
+            &ExchangeError::new(ExchangeErrorKind::RateLimited, "test rate limit")
+                .with_retry_after(Duration::from_millis(300)),
+        ),
+    )
+    .unwrap();
+    let second = client.query_order(&symbol, &client_order_id);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(150), first)
+            .await
+            .expect("inbound response was blocked by the retry timer")
+            .unwrap()
+            .status,
+        "NEW"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("deferred command was not retried")
+            .unwrap()
+            .status,
+        "NEW"
+    );
 
     http_server.await.unwrap();
     ws_server.await.unwrap();
