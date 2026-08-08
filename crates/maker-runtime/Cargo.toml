@@ -10,6 +10,7 @@ core_affinity = "0.8"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 rtrb = "=0.3.4"
+serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 
 [dev-dependencies]

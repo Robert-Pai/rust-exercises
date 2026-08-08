@@ -544,7 +544,7 @@ async fn connection_failure_drains_pending_then_next_command_reconnects() {
 }
 
 #[tokio::test]
-async fn sends_all_order_mutations_over_one_signed_websocket_connection() {
+async fn sends_supported_order_mutations_over_one_signed_websocket_connection() {
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_address = http_listener.local_addr().unwrap();
     let http_server = tokio::spawn(async move {
@@ -583,7 +583,6 @@ async fn sends_all_order_mutations_over_one_signed_websocket_connection() {
             "order.cancel",
             "order.status",
             "order.status",
-            "openOrders.cancelAll",
         ]
         .into_iter()
         .enumerate()
@@ -619,10 +618,6 @@ async fn sends_all_order_mutations_over_one_signed_websocket_connection() {
                 }),
                 ("order.status", 2) => order_result("CANCELED", "0.000"),
                 ("order.status", 3) => order_result("FILLED", "0.001"),
-                ("openOrders.cancelAll", _) => json!({
-                    "code": 200,
-                    "msg": "The operation of cancel all open order is done."
-                }),
                 _ => unreachable!(),
             };
             socket
@@ -673,7 +668,6 @@ async fn sends_all_order_mutations_over_one_signed_websocket_connection() {
     assert_eq!(canceled.unwrap().status, "CANCELED");
     let queried = client.query_order(&symbol, &client_order_id).await.unwrap();
     assert_eq!(queried.status, "FILLED");
-    client.cancel_all(&symbol).await.unwrap();
 
     http_server.await.unwrap();
     ws_server.await.unwrap();

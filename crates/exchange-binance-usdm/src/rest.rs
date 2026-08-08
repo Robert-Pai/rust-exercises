@@ -13,8 +13,8 @@ use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
     error,
     models::{
-        ApiErrorDto, BookTickerDto, DualSidePositionDto, ExchangeInfoDto, ExchangeSymbolDto,
-        ListenKeyDto, ServerTimeDto,
+        ApiErrorDto, BookTickerDto, CancelAllOrdersDto, DualSidePositionDto, ExchangeInfoDto,
+        ExchangeSymbolDto, ListenKeyDto, ServerTimeDto,
     },
     rate_limit::{
         AcquireDecision, RateLimitSnapshot, RequestCost, RequestRateLimiter,
@@ -128,6 +128,26 @@ impl RestClient {
     pub(crate) async fn position_mode(&self) -> ExchangeResult<DualSidePositionDto> {
         self.signed_json(Method::GET, "/fapi/v1/positionSide/dual", Vec::new())
             .await
+    }
+
+    pub(crate) async fn cancel_all(&self, symbol: &Symbol) -> ExchangeResult<()> {
+        let response: CancelAllOrdersDto = self
+            .signed_json(
+                Method::DELETE,
+                "/fapi/v1/allOpenOrders",
+                vec![("symbol".to_owned(), symbol.as_str().to_owned())],
+            )
+            .await?;
+        if response.code != 200 {
+            return Err(ExchangeError::new(
+                ExchangeErrorKind::InvalidResponse,
+                format!(
+                    "Binance REST cancel-all result had code {}: {}",
+                    response.code, response.message
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn create_listen_key(&self) -> ExchangeResult<String> {
@@ -457,6 +477,64 @@ mod tests {
         assert_eq!(
             signature,
             sign_payload(unsigned_query, credentials.signing_key())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancels_all_symbol_orders_through_signed_futures_rest_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            for response_body in [
+                r#"{"serverTime":1700000000000}"#,
+                r#"{"code":200,"msg":"The operation of cancel all open order is done."}"#,
+            ] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut connection).await;
+                sender.send(request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                connection.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let config = BinanceUsdmConfig::new(
+            format!("http://{address}"),
+            "wss://example.test",
+            "wss://api.example.test/ws-fapi/v1",
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            Duration::from_secs(240),
+        )
+        .unwrap();
+        let credentials = BinanceCredentials::new(
+            SecretString::new("test-key".to_owned()),
+            SecretString::new(crate::config::TEST_PRIVATE_KEY_PEM.to_owned()),
+        )
+        .unwrap();
+        let client = RestClient::new(&config, credentials).unwrap();
+
+        client
+            .cancel_all(&Symbol::new("BTCUSDT").unwrap())
+            .await
+            .unwrap();
+
+        let time_request = receiver.recv().await.unwrap();
+        let cancel_request = receiver.recv().await.unwrap();
+        server.await.unwrap();
+        assert!(time_request.starts_with("GET /fapi/v1/time HTTP/1.1\r\n"));
+        assert!(cancel_request.starts_with("DELETE /fapi/v1/allOpenOrders?symbol=BTCUSDT&"));
+        assert!(cancel_request.contains("recvWindow=5000"));
+        assert!(cancel_request.contains("timestamp="));
+        assert!(cancel_request.contains("&signature="));
+        assert!(
+            cancel_request
+                .to_ascii_lowercase()
+                .contains("\r\nx-mbx-apikey: test-key\r\n")
         );
     }
 

@@ -8,7 +8,15 @@ use std::{
     task::{Context, Poll},
 };
 
+use serde::Deserialize;
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    EventDriven,
+    BusySpin,
+}
 
 #[derive(Debug, Error)]
 pub enum CpuAffinityError {

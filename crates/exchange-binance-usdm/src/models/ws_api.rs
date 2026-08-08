@@ -20,10 +20,3 @@ pub(crate) struct WsApiOrderDto {
     pub(crate) executed_qty: String,
     pub(crate) status: String,
 }
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WsApiCancelAllDto {
-    pub(crate) code: i64,
-    #[serde(rename = "msg")]
-    pub(crate) message: String,
-}

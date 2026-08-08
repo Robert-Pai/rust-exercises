@@ -870,6 +870,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "rtrb",
+ "serde",
  "thiserror",
  "tokio",
 ]

@@ -10,6 +10,13 @@ pub(crate) struct ApiErrorDto {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CancelAllOrdersDto {
+    pub(crate) code: i64,
+    #[serde(rename = "msg")]
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RateLimitDto {
     #[serde(rename = "rateLimitType")]

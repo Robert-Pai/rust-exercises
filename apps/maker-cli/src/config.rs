@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use exchange_binance_usdm::{BinanceCredentials, BinanceUsdmConfig};
 use maker_domain::Symbol;
 use maker_engine::EngineConfig;
+use maker_runtime::ExecutionMode;
 use rust_decimal::Decimal;
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -89,8 +90,10 @@ impl AppConfig {
             )?,
         )
         .context("invalid Binance adapter configuration")?
-        .with_network_cpu_cores(
+        .with_network_runtimes(
+            self.runtime.market_data_mode,
             self.runtime.market_data_cpu_core,
+            self.runtime.trading_mode,
             self.runtime.trading_cpu_core,
         );
 
@@ -140,6 +143,7 @@ impl AppConfig {
         };
 
         let strategy_runtime = StrategyRuntimeSettings {
+            mode: self.runtime.strategy_mode,
             cpu_core: self.runtime.strategy_cpu_core,
         };
 
@@ -179,12 +183,22 @@ struct RuntimeConfig {
     reconcile_interval_ms: u64,
     instrument_refresh_interval_secs: u64,
     reconnect_delay_ms: u64,
+    #[serde(default = "default_execution_mode")]
+    strategy_mode: ExecutionMode,
     #[serde(default)]
     strategy_cpu_core: Option<usize>,
+    #[serde(default = "default_execution_mode")]
+    market_data_mode: ExecutionMode,
     #[serde(default)]
     market_data_cpu_core: Option<usize>,
+    #[serde(default = "default_execution_mode")]
+    trading_mode: ExecutionMode,
     #[serde(default)]
     trading_cpu_core: Option<usize>,
+}
+
+const fn default_execution_mode() -> ExecutionMode {
+    ExecutionMode::BusySpin
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,8 +289,11 @@ quantity = "0.001"
 reconcile_interval_ms = 1000
 instrument_refresh_interval_secs = 3600
 reconnect_delay_ms = 1000
+strategy_mode = "busy_spin"
 strategy_cpu_core = 1
+market_data_mode = "event_driven"
 market_data_cpu_core = 3
+trading_mode = "event_driven"
 trading_cpu_core = 2
 
 [logging]
@@ -310,8 +327,11 @@ stdout = false
         assert_eq!(engine.symbol().as_str(), "BTCUSDT");
         assert_eq!(engine.levels_per_side().get(), 5);
         assert_eq!(engine.take_profit_ticks().get(), 3);
+        assert_eq!(runtime.mode, ExecutionMode::BusySpin);
         assert_eq!(runtime.cpu_core, Some(1));
+        assert_eq!(exchange.market_data_mode(), ExecutionMode::EventDriven);
         assert_eq!(exchange.market_data_cpu_core(), Some(3));
+        assert_eq!(exchange.trading_mode(), ExecutionMode::EventDriven);
         assert_eq!(exchange.trading_cpu_core(), Some(2));
         assert_eq!(logging.level(), LevelFilter::INFO);
         assert_eq!(logging.directory(), Path::new("logs"));
@@ -339,6 +359,21 @@ stdout = false
 
         assert_eq!(exchange.market_data_cpu_core(), None);
         assert_eq!(exchange.trading_cpu_core(), None);
+    }
+
+    #[test]
+    fn defaults_omitted_execution_modes_to_busy_spin() {
+        let contents = VALID_CONFIG
+            .replace("strategy_mode = \"busy_spin\"\n", "")
+            .replace("market_data_mode = \"event_driven\"\n", "")
+            .replace("trading_mode = \"event_driven\"\n", "");
+        let file = config_file(&contents);
+        let config = AppConfig::load(file.path()).unwrap();
+        let (exchange, _, _, _, runtime) = config.into_components().unwrap();
+
+        assert_eq!(runtime.mode, ExecutionMode::BusySpin);
+        assert_eq!(exchange.market_data_mode(), ExecutionMode::BusySpin);
+        assert_eq!(exchange.trading_mode(), ExecutionMode::BusySpin);
     }
 
     #[test]

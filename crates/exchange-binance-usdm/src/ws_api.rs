@@ -13,7 +13,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
     error,
-    models::{ApiErrorDto, RateLimitDto, WsApiCancelAllDto, WsApiOrderAckDto, WsApiOrderDto},
+    models::{ApiErrorDto, RateLimitDto, WsApiOrderAckDto, WsApiOrderDto},
     network::NetworkRuntime,
     rate_limit::{
         AcquireDecision, RateLimitSnapshot, RequestCost, RequestRateLimiter,
@@ -207,26 +207,6 @@ impl WsApiClient {
             "order.status",
             order_identity_parameters(symbol, client_order_id),
         )
-    }
-
-    pub(crate) fn cancel_all(&mut self, symbol: &Symbol) -> ExchangeFuture<()> {
-        let response = self.request::<WsApiCancelAllDto>(
-            "openOrders.cancelAll",
-            Parameters::from([("symbol".to_owned(), json!(symbol.as_str()))]),
-        );
-        Box::pin(async move {
-            let response = response.await?;
-            if response.code != 200 {
-                return Err(ExchangeError::new(
-                    ExchangeErrorKind::InvalidResponse,
-                    format!(
-                        "Binance WebSocket cancel-all result had code {}: {}",
-                        response.code, response.message
-                    ),
-                ));
-            }
-            Ok(())
-        })
     }
 
     fn request<T>(&mut self, method: &'static str, parameters: Parameters) -> ExchangeFuture<T>
@@ -451,7 +431,7 @@ fn queue_timeout(response_timeout: Duration) -> Duration {
 
 fn request_cost(method: &str) -> RequestCost {
     match method {
-        "order.place" | "order.cancel" | "openOrders.cancelAll" => RequestCost::ORDER,
+        "order.place" | "order.cancel" => RequestCost::ORDER,
         _ => RequestCost::GENERIC,
     }
 }

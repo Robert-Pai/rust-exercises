@@ -26,10 +26,12 @@ When a TakeProfit fills, it closes that grid transition and only restores a
 far-side Quote. `Quote`/`TakeProfit` is grid metadata and is independent of
 the exchange order status. Partial fills do not roll the grid.
 The private Binance WebSocket drives fills; a periodic reconciler only repairs
-failed order mutations. Order placement, single-order cancellation,
-symbol-wide cancellation, and uncertain-order lookup all use the Binance
-USD-M WebSocket API. REST is limited to exchange metadata, initial snapshots,
-position-mode validation, clock synchronization, and listen-key lifecycle.
+failed order mutations. Order placement, single-order cancellation, and
+uncertain-order lookup use the Binance USD-M WebSocket API. Symbol-wide
+cancellation uses the signed REST `DELETE /fapi/v1/allOpenOrders` endpoint,
+because the USD-M WebSocket API does not expose a cancel-all method. REST also
+handles exchange metadata, initial snapshots, position-mode validation, clock
+synchronization, and listen-key lifecycle.
 Exchange trading rules are loaded before the first grid is built. The adapter then keeps the single configured instrument snapshot in the
 move-only strategy session; every
 `runtime.instrument_refresh_interval_secs` it fetches a candidate update. A
@@ -98,13 +100,12 @@ listen-key keepalive, trading WebSocket API requests, and clock synchronization.
 Both share the same cloneable REST client state, but public market bursts cannot
 consume scheduler time on the latency-critical private/trading runtime.
 
-Both network runtimes and the strategy runtime are always busy-polled. Project
-control flow therefore never selects an event-driven parking mode. Each runtime
-continuously self-wakes so Tokio uses non-blocking driver polls; this consumes
-one CPU core per dedicated thread and can reduce local wake-up jitter, but it
-does not bypass Tokio, socket readiness, or the kernel TCP stack.
-`runtime.market_data_cpu_core` and `runtime.trading_cpu_core` independently
-select logical CPUs.
+`runtime.market_data_mode` and `runtime.trading_mode` independently select
+`"event_driven"` or `"busy_spin"`. Event-driven runtimes park in Tokio when no
+I/O or timer is ready. Busy-spin runtimes continuously self-wake and consume one
+CPU core to reduce local wake-up jitter, but they do not bypass Tokio, socket
+readiness, or the kernel TCP stack. The corresponding CPU-core settings remain
+independent of the selected execution mode.
 
 The engine owns a separate `maker-strategy` OS thread and a current-thread
 Tokio runtime. Recurring FIFO communication between strategy and the two network
@@ -127,8 +128,11 @@ the existing recovery and symbol-wide cancellation path. The trading WebSocket
 worker independently uses 256 fixed transport-request slots because retries and
 cancel-all requests do not have a one-to-one client order ID.
 
-All three dedicated runtimes use the same busy-poll policy and therefore consume
-one CPU core continuously. The strategy, market-data, and trading CPU selectors are resolved by `core_affinity`; they should name separate logical
+`runtime.strategy_mode` independently controls the strategy runtime with the
+same `"event_driven"` and `"busy_spin"` values. Omitted mode settings preserve
+the current busy-spin behavior. The example keeps strategy busy-polled while
+both network runtimes are event-driven. The strategy, market-data, and trading
+CPU selectors are resolved by `core_affinity`; they should name separate logical
 CPUs. On a four-core Linux low-latency host, the example reserves core 1 for strategy,
 core 2 for private trading, core 3 for public market data, and leaves core 0 for
 the OS, logging, and kernel network work. On Linux each selector indexes the
@@ -138,13 +142,14 @@ only and Mach affinity tags do not provide hard CPU pinning.
 
 The no-blocking guarantee applies to project-owned production code executing on
 `maker-strategy`, `maker-network-market-data`, and `maker-network-trading`:
-there are no project mutexes, read/write locks, blocking waits, runtime parking
-modes, watch/MPSC control channels, or synchronous output calls on those paths.
-Bounded SPSC rings, atomics, `AtomicWaker`, bounded startup spinning, and
-asynchronous socket/HTTP I/O are permitted. Synchronization inside Tokio,
-reqwest/hyper, rustls, DNS, the allocator, the OS, and other dependencies is
-outside this project-owned proof boundary. A source-policy integration test
-rejects forbidden primitives in covered production modules.
+there are no project mutexes, read/write locks, blocking channel operations,
+watch/MPSC control channels, or synchronous output calls on those paths.
+Configured event-driven runtimes may park inside Tokio while waiting for I/O or
+timers; bounded SPSC rings, atomics, `AtomicWaker`, bounded startup spinning,
+and asynchronous socket/HTTP I/O remain permitted. Synchronization inside
+Tokio, reqwest/hyper, rustls, DNS, the allocator, the OS, and other dependencies
+is outside this project-owned proof boundary. A source-policy integration test
+rejects forbidden project primitives in covered production modules.
 
 ## Verify
 

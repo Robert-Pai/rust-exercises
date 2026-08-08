@@ -2,7 +2,8 @@
 //!
 //! Public market data and latency-critical trading traffic are scheduled on
 //! separate current-thread Tokio runtimes so bursts on one cannot delay the
-//! other. Each runtime has independently configurable CPU affinity.
+//! other. Each runtime has independently configurable parking behavior and CPU
+//! affinity.
 
 use std::{
     future::Future,
@@ -16,7 +17,9 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult};
-use maker_runtime::{BusyPoll, SpscConsumer, SpscProducer, TryPushError, bind_cpu, spsc_channel};
+use maker_runtime::{
+    BusyPoll, ExecutionMode, SpscConsumer, SpscProducer, TryPushError, bind_cpu, spsc_channel,
+};
 use tokio::sync::oneshot;
 
 use crate::config::BinanceUsdmConfig;
@@ -71,9 +74,9 @@ impl NetworkRuntime {
                 )
             })?;
         let (tasks, receiver) = spsc_channel(TASK_BUFFER);
-        let cpu_core = match role {
-            NetworkRole::MarketData => config.market_data_cpu_core(),
-            NetworkRole::Trading => config.trading_cpu_core(),
+        let (mode, cpu_core) = match role {
+            NetworkRole::MarketData => (config.market_data_mode(), config.market_data_cpu_core()),
+            NetworkRole::Trading => (config.trading_mode(), config.trading_cpu_core()),
         };
 
         let startup = Arc::new(AtomicU8::new(STARTING));
@@ -86,7 +89,12 @@ impl NetworkRuntime {
                     return;
                 }
                 worker_startup.store(READY, Ordering::Release);
-                runtime.block_on(BusyPoll::new(run_network_loop(receiver)));
+                match mode {
+                    ExecutionMode::EventDriven => runtime.block_on(run_network_loop(receiver)),
+                    ExecutionMode::BusySpin => {
+                        runtime.block_on(BusyPoll::new(run_network_loop(receiver)))
+                    }
+                }
             })
             .map_err(|error| {
                 ExchangeError::new(
@@ -206,6 +214,19 @@ mod tests {
     async fn busy_spin_runtime_drives_network_operations() {
         let mut runtime =
             NetworkRuntime::new(NetworkRole::Trading, &BinanceUsdmConfig::default()).unwrap();
+
+        assert_eq!(runtime.call(async { Ok(7_u8) }).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn event_driven_runtime_wakes_for_network_operations() {
+        let config = BinanceUsdmConfig::default().with_network_runtimes(
+            ExecutionMode::EventDriven,
+            None,
+            ExecutionMode::EventDriven,
+            None,
+        );
+        let mut runtime = NetworkRuntime::new(NetworkRole::Trading, &config).unwrap();
 
         assert_eq!(runtime.call(async { Ok(7_u8) }).await.unwrap(), 7);
     }

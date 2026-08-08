@@ -173,7 +173,9 @@ impl TradingPort for BinanceUsdm {
     }
 
     fn cancel_all(&mut self, symbol: Symbol) -> ExchangeFuture<()> {
-        self.trading.cancel_all(&symbol)
+        let rest = self.rest.clone();
+        self.trading_network
+            .call(async move { rest.cancel_all(&symbol).await })
     }
 }
 
