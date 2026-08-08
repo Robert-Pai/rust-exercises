@@ -32,6 +32,7 @@ pub struct LoggingSettings {
     directory: PathBuf,
     retention_days: u64,
     level: LevelFilter,
+    stdout: bool,
 }
 
 impl LoggingSettings {
@@ -45,6 +46,10 @@ impl LoggingSettings {
 
     pub const fn level(&self) -> LevelFilter {
         self.level
+    }
+
+    pub const fn stdout_enabled(&self) -> bool {
+        self.stdout
     }
 }
 
@@ -131,6 +136,7 @@ impl AppConfig {
             directory: PathBuf::from(self.logging.directory),
             retention_days: self.logging.retention_days,
             level,
+            stdout: self.logging.stdout,
         };
 
         let strategy_runtime = StrategyRuntimeSettings {
@@ -187,6 +193,8 @@ struct LoggingConfig {
     level: String,
     directory: String,
     retention_days: u64,
+    #[serde(default)]
+    stdout: bool,
 }
 
 pub fn config_path_from_args() -> Result<PathBuf> {
@@ -275,6 +283,7 @@ trading_cpu_core = 2
 level = "info"
 directory = "logs"
 retention_days = 14
+stdout = false
 "#;
 
     fn config_file(contents: &str) -> NamedTempFile {
@@ -307,6 +316,16 @@ retention_days = 14
         assert_eq!(logging.level(), LevelFilter::INFO);
         assert_eq!(logging.directory(), Path::new("logs"));
         assert_eq!(logging.retention_days(), 14);
+        assert!(!logging.stdout_enabled());
+    }
+
+    #[test]
+    fn configures_stdout_logging() {
+        let file = config_file(&VALID_CONFIG.replace("stdout = false", "stdout = true"));
+        let config = AppConfig::load(file.path()).unwrap();
+        let (_, _, _, logging, _) = config.into_components().unwrap();
+
+        assert!(logging.stdout_enabled());
     }
 
     #[test]

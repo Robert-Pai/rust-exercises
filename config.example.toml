@@ -41,3 +41,5 @@ trading_cpu_core = 2
 level = "info"
 directory = "logs"
 retention_days = 14
+# Set true to also write compact logs to stdout.
+stdout = false

@@ -60,11 +60,13 @@ fn init_logging(settings: &LoggingSettings) -> Result<WorkerGuard> {
     let appender = rolling::daily(settings.directory(), "maker.log");
     let (file_writer, guard) = tracing_appender::non_blocking(appender);
     let level = settings.level();
-    let stdout_layer = fmt::layer()
-        .compact()
-        .with_target(false)
-        .with_ansi(false)
-        .with_filter(level);
+    let stdout_layer = settings.stdout_enabled().then(|| {
+        fmt::layer()
+            .compact()
+            .with_target(false)
+            .with_ansi(false)
+            .with_filter(level)
+    });
     let file_layer = fmt::layer()
         .json()
         .with_target(false)
