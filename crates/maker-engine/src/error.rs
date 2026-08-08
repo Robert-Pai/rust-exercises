@@ -40,6 +40,9 @@ pub enum EngineError {
     #[error(transparent)]
     DomainValue(#[from] ValueError),
 
+    #[error("fixed engine storage `{storage}` is full; quoting must recover without eviction")]
+    CapacityExhausted { storage: &'static str },
+
     #[error("client-order session counter overflowed")]
     SessionOverflow,
 
@@ -67,6 +70,7 @@ impl EngineError {
     pub(crate) fn recommends_recovery(&self) -> bool {
         match self {
             Self::AdapterContract(_)
+            | Self::CapacityExhausted { .. }
             | Self::Registry(_)
             | Self::SymbolMismatch { .. }
             | Self::InstrumentRulesChanged { .. } => true,

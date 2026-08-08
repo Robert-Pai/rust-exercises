@@ -63,22 +63,24 @@ impl GridModel {
         self.revision
     }
 
-    /// Returns levels in executable priority order: best price to farthest price.
-    pub fn levels(&self, side: Side) -> Vec<GridLevel> {
+    /// Visits levels in executable priority order without allocating a snapshot.
+    pub fn for_each_level(&self, side: Side, mut visit: impl FnMut(GridLevel)) {
         let quantity = self.config.quantity();
         match side {
-            Side::Buy => self
-                .bids
-                .iter()
-                .rev()
-                .map(|(&price, &purpose)| GridLevel::new(side, price, quantity, purpose))
-                .collect(),
-            Side::Sell => self
-                .asks
-                .iter()
-                .map(|(&price, &purpose)| GridLevel::new(side, price, quantity, purpose))
-                .collect(),
+            Side::Buy => self.bids.iter().rev().for_each(|(&price, &purpose)| {
+                visit(GridLevel::new(side, price, quantity, purpose));
+            }),
+            Side::Sell => self.asks.iter().for_each(|(&price, &purpose)| {
+                visit(GridLevel::new(side, price, quantity, purpose));
+            }),
         }
+    }
+
+    /// Returns levels in executable priority order: best price to farthest price.
+    pub fn levels(&self, side: Side) -> Vec<GridLevel> {
+        let mut levels = Vec::with_capacity(self.config.levels_per_side().get());
+        self.for_each_level(side, |level| levels.push(level));
+        levels
     }
 
     pub fn contains(&self, side: Side, price: PriceTicks) -> bool {

@@ -472,6 +472,30 @@ async fn stop_engine(
 }
 
 #[tokio::test]
+async fn boots_and_reconciles_at_the_maximum_grid_capacity() {
+    let exchange = MockExchange::new();
+    let maximum_config = EngineConfig::new(
+        Symbol::new("BTCUSDT").unwrap(),
+        64,
+        1,
+        1,
+        1,
+        Decimal::new(2, 3),
+        Duration::from_millis(20),
+        Duration::from_secs(3600),
+        Duration::from_millis(5),
+    )
+    .unwrap();
+    let (shutdown, task) = start_engine_with_config(exchange.clone(), maximum_config);
+
+    exchange.wait_for_accepted(128).await;
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(exchange.accepted_orders().len(), 128);
+
+    stop_engine(shutdown, task).await;
+}
+
+#[tokio::test]
 async fn bootstraps_streams_before_cancel_and_places_both_sides() {
     let exchange = MockExchange::new();
     let (shutdown, task) = start_engine(exchange.clone());

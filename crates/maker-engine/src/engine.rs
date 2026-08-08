@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
@@ -17,6 +16,7 @@ use maker_ports::{
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
+use crate::storage::{FixedVec, IdMap, IdSet, LIFECYCLE_CAPACITY, MAX_GRID_LEVELS};
 use crate::{EngineConfig, EngineError, OrderRegistry};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -42,18 +42,18 @@ pub struct MakerEngine {
     grid: Option<GridModel>,
     latest_book: Option<LatestBbo>,
     registry: OrderRegistry,
-    placement_attempts: HashMap<ClientOrderId, GridLevel>,
-    inflight_placements: HashSet<ClientOrderId>,
-    filled_before_ack: HashSet<ClientOrderId>,
-    pre_ack_updates: HashMap<ClientOrderId, OrderUpdate>,
-    unresolved_attempts: HashSet<ClientOrderId>,
-    inflight_cancels: HashSet<ClientOrderId>,
-    deferred_cancels: HashSet<ClientOrderId>,
-    deferred_placements: HashSet<GridLevel>,
+    placement_attempts: IdMap<GridLevel>,
+    inflight_placements: IdSet,
+    filled_before_ack: IdSet,
+    pre_ack_updates: IdMap<OrderUpdate>,
+    unresolved_attempts: IdSet,
+    inflight_cancels: IdSet,
+    deferred_cancels: IdSet,
+    deferred_placements: FixedVec<GridLevel, MAX_GRID_LEVELS>,
     instrument_refresh_inflight: bool,
-    pending_fills: HashMap<ClientOrderId, PendingFill>,
-    pending_fill_order: VecDeque<ClientOrderId>,
-    placement_priority: Vec<GridLevel>,
+    pending_fills: IdMap<PendingFill>,
+    pending_fill_order: FixedVec<ClientOrderId, LIFECYCLE_CAPACITY>,
+    placement_priority: FixedVec<GridLevel, MAX_GRID_LEVELS>,
     session_seed: u32,
     session_generation: u8,
     next_order_sequence: u32,
@@ -75,18 +75,18 @@ impl MakerEngine {
             grid: None,
             latest_book: None,
             registry: OrderRegistry::new(),
-            placement_attempts: HashMap::new(),
-            inflight_placements: HashSet::new(),
-            filled_before_ack: HashSet::new(),
-            pre_ack_updates: HashMap::new(),
-            unresolved_attempts: HashSet::new(),
-            inflight_cancels: HashSet::new(),
-            deferred_cancels: HashSet::new(),
-            deferred_placements: HashSet::new(),
+            placement_attempts: IdMap::default(),
+            inflight_placements: IdSet::default(),
+            filled_before_ack: IdSet::default(),
+            pre_ack_updates: IdMap::default(),
+            unresolved_attempts: IdSet::default(),
+            inflight_cancels: IdSet::default(),
+            deferred_cancels: IdSet::default(),
+            deferred_placements: FixedVec::default(),
             instrument_refresh_inflight: false,
-            pending_fills: HashMap::new(),
-            pending_fill_order: VecDeque::new(),
-            placement_priority: Vec::new(),
+            pending_fills: IdMap::default(),
+            pending_fill_order: FixedVec::default(),
+            placement_priority: FixedVec::default(),
             session_seed,
             session_generation: 0,
             next_order_sequence: 0,
@@ -426,7 +426,10 @@ impl MakerEngine {
             {
                 validate_attempt_update(level, &update)?;
                 self.pre_ack_updates
-                    .insert(*update.client_order_id(), update);
+                    .insert(*update.client_order_id(), update)
+                    .map_err(|()| EngineError::CapacityExhausted {
+                        storage: "pre-ack update lifecycle slots",
+                    })?;
             }
             return Ok(());
         }
@@ -453,20 +456,44 @@ impl MakerEngine {
             }
         };
 
+        let filled_before_ack = self.inflight_placements.contains(update.client_order_id());
+        if filled_before_ack {
+            self.filled_before_ack
+                .insert(*update.client_order_id())
+                .map_err(|()| EngineError::CapacityExhausted {
+                    storage: "filled-before-ack lifecycle slots",
+                })?;
+        }
+
         match self.apply_fill(level) {
             Ok(()) => {
                 self.finish_fill(update.client_order_id());
             }
             Err(error) if is_deferrable_fill(&error) => {
+                if filled_before_ack {
+                    self.filled_before_ack.remove(update.client_order_id());
+                }
                 let client_order_id = *update.client_order_id();
-                let was_pending = self
-                    .pending_fills
-                    .insert(client_order_id, PendingFill { update, level });
-                if was_pending.is_none() {
-                    self.pending_fill_order.push_back(client_order_id);
+                if !self.pending_fills.contains_key(&client_order_id) {
+                    self.pending_fills
+                        .insert(client_order_id, PendingFill { update, level })
+                        .map_err(|()| EngineError::CapacityExhausted {
+                            storage: "pending fills",
+                        })?;
+                    if self.pending_fill_order.push(client_order_id).is_err() {
+                        self.pending_fills.remove(&client_order_id);
+                        return Err(EngineError::CapacityExhausted {
+                            storage: "pending fill FIFO",
+                        });
+                    }
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if filled_before_ack {
+                    self.filled_before_ack.remove(update.client_order_id());
+                }
+                return Err(error.into());
+            }
         }
         self.drain_pending_fills()
     }
@@ -488,7 +515,21 @@ impl MakerEngine {
         if let Some(reassignment) = transition.reassignment() {
             self.apply_local_reassignment(reassignment);
         }
-        self.placement_priority.extend(transition.placements());
+        let desired = self.desired_levels();
+        self.placement_priority
+            .retain(|level| contains_level(&desired, *level));
+        for placement in transition.placements() {
+            if !self
+                .placement_priority
+                .iter()
+                .any(|level| level.same_order(placement))
+                && contains_level(&desired, placement)
+            {
+                self.placement_priority
+                    .push(placement)
+                    .expect("unique desired priorities fit grid capacity");
+            }
+        }
         Ok(())
     }
 
@@ -511,48 +552,52 @@ impl MakerEngine {
                 pending.level = current;
             }
         }
-        if self.deferred_placements.remove(&previous) {
-            self.deferred_placements.insert(current);
+        let deferred_index = self
+            .deferred_placements
+            .iter()
+            .position(|level| level.same_order(previous));
+        if let Some(index) = deferred_index {
+            self.deferred_placements.remove(index);
+            if !self
+                .deferred_placements
+                .iter()
+                .any(|level| level.same_order(current))
+            {
+                self.deferred_placements
+                    .push(current)
+                    .expect("reassignment preserves deferred-placement length");
+            }
         }
     }
 
     fn drain_pending_fills(&mut self) -> Result<(), EngineError> {
         loop {
-            let mut progressed = false;
-            let client_order_ids: Vec<_> = self.pending_fill_order.iter().cloned().collect();
-
-            for client_order_id in client_order_ids {
-                let Some(pending) = self.pending_fills.get(&client_order_id).cloned() else {
-                    self.pending_fill_order
-                        .retain(|candidate| candidate != &client_order_id);
-                    continue;
-                };
-                let level = match self.registry.validate_update(&pending.update)? {
-                    Some(level) => level,
-                    None => {
-                        validate_attempt_update(pending.level, &pending.update)?;
-                        pending.level
-                    }
-                };
-
-                match self.apply_fill(level) {
-                    Ok(()) => {
-                        if self.registry.get(&client_order_id).is_some() {
-                            self.registry.apply_update(&pending.update)?;
-                        }
-                        self.finish_fill(&client_order_id);
-                        self.pending_fills.remove(&client_order_id);
-                        self.pending_fill_order
-                            .retain(|candidate| candidate != &client_order_id);
-                        progressed = true;
-                    }
-                    Err(error) if is_deferrable_fill(&error) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-
-            if !progressed {
+            let Some(client_order_id) = self.pending_fill_order.get(0).copied() else {
                 return Ok(());
+            };
+            let Some(pending) = self.pending_fills.get(&client_order_id).cloned() else {
+                self.pending_fill_order.remove(0);
+                continue;
+            };
+            let level = match self.registry.validate_update(&pending.update)? {
+                Some(level) => level,
+                None => {
+                    validate_attempt_update(pending.level, &pending.update)?;
+                    pending.level
+                }
+            };
+
+            match self.apply_fill(level) {
+                Ok(()) => {
+                    if self.registry.get(&client_order_id).is_some() {
+                        self.registry.apply_update(&pending.update)?;
+                    }
+                    self.finish_fill(&client_order_id);
+                    self.pending_fills.remove(&client_order_id);
+                    self.pending_fill_order.remove(0);
+                }
+                Err(error) if is_deferrable_fill(&error) => return Ok(()),
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -563,60 +608,61 @@ impl MakerEngine {
     ) -> Result<(), EngineError> {
         self.drain_pending_fills()?;
         let desired_levels = self.desired_levels();
-        let desired: HashSet<_> = desired_levels.iter().copied().collect();
 
-        let mut unresolved: Vec<_> = self
-            .unresolved_attempts
-            .iter()
-            .filter(|client_order_id| {
-                !self.inflight_cancels.contains(*client_order_id)
-                    && !self.deferred_cancels.contains(*client_order_id)
-            })
-            .cloned()
-            .collect();
-        unresolved.sort();
-        for client_order_id in unresolved {
+        let mut unresolved = FixedVec::<ClientOrderId, LIFECYCLE_CAPACITY>::default();
+        for client_order_id in self.unresolved_attempts.iter().filter(|client_order_id| {
+            !self.inflight_cancels.contains(client_order_id)
+                && !self.deferred_cancels.contains(client_order_id)
+        }) {
+            unresolved
+                .push(client_order_id)
+                .expect("lifecycle set cannot exceed lifecycle scratch capacity");
+        }
+        unresolved.sort_by(Ord::cmp);
+        for client_order_id in unresolved.iter().copied() {
             self.schedule_cancel(
                 commands,
                 client_order_id,
                 CancellationKind::ResolveUncertain,
-            );
+            )?;
         }
 
-        let mut undesired: Vec<_> = self
-            .registry
-            .active_orders()
-            .into_iter()
-            .filter(|order| {
-                !desired.contains(&order.level())
-                    && !self.inflight_cancels.contains(order.client_order_id())
-                    && !self.deferred_cancels.contains(order.client_order_id())
-            })
-            .map(|order| (*order.client_order_id(), order.level()))
-            .collect();
-        undesired.sort_by_key(|(_, level)| (level.side(), level.price()));
-        for (client_order_id, _) in undesired {
-            self.schedule_cancel(commands, client_order_id, CancellationKind::Undesired);
+        let mut undesired = FixedVec::<(ClientOrderId, GridLevel), LIFECYCLE_CAPACITY>::default();
+        for order in self.registry.active_iter().filter(|order| {
+            !contains_level(&desired_levels, order.level())
+                && !self.inflight_cancels.contains(order.client_order_id())
+                && !self.deferred_cancels.contains(order.client_order_id())
+        }) {
+            undesired
+                .push((*order.client_order_id(), order.level()))
+                .expect("registry cannot exceed lifecycle scratch capacity");
+        }
+        undesired.sort_by(|(_, left), (_, right)| {
+            (left.side(), left.price()).cmp(&(right.side(), right.price()))
+        });
+        for (client_order_id, _) in undesired.iter().copied() {
+            self.schedule_cancel(commands, client_order_id, CancellationKind::Undesired)?;
         }
 
         self.placement_priority.retain(|level| {
-            desired.contains(level)
+            contains_level(&desired_levels, *level)
                 && !self.registry.has_active_level(*level)
                 && !self
                     .placement_attempts
                     .values()
                     .any(|attempt| attempt.same_order(*level))
         });
-        let mut blocked_levels: Vec<_> = self
-            .pending_fills
-            .values()
-            .filter_map(|pending| {
-                self.grid
-                    .as_ref()
-                    .and_then(|grid| grid.level(pending.update.side(), pending.update.price()))
-            })
-            .collect();
-        blocked_levels.extend(self.placement_attempts.values().copied());
+        let mut blocked_levels = FixedVec::<GridLevel, MAX_GRID_LEVELS>::default();
+        for level in self.pending_fills.values().filter_map(|pending| {
+            self.grid
+                .as_ref()
+                .and_then(|grid| grid.level(pending.update.side(), pending.update.price()))
+        }) {
+            push_unique_level(&mut blocked_levels, level)?;
+        }
+        for level in self.placement_attempts.values().copied() {
+            push_unique_level(&mut blocked_levels, level)?;
+        }
 
         while let Some(level) =
             self.next_missing_level(&desired_levels, &blocked_levels, &self.deferred_placements)
@@ -629,9 +675,12 @@ impl MakerEngine {
                 level.price(),
                 level.quantity(),
             );
-            self.placement_attempts.insert(client_order_id, level);
-            self.inflight_placements.insert(client_order_id);
-            blocked_levels.push(level);
+            self.reserve_placement(client_order_id, level)?;
+            if let Err(error) = push_unique_level(&mut blocked_levels, level) {
+                self.placement_attempts.remove(&client_order_id);
+                self.inflight_placements.remove(&client_order_id);
+                return Err(error);
+            }
 
             let request = self.exchange.place_post_only(intent);
             commands.push(
@@ -650,13 +699,36 @@ impl MakerEngine {
         Ok(())
     }
 
+    fn reserve_placement(
+        &mut self,
+        client_order_id: ClientOrderId,
+        level: GridLevel,
+    ) -> Result<(), EngineError> {
+        self.placement_attempts
+            .insert(client_order_id, level)
+            .map_err(|()| EngineError::CapacityExhausted {
+                storage: "placement-attempt lifecycle slots",
+            })?;
+        if self.inflight_placements.insert(client_order_id).is_err() {
+            self.placement_attempts.remove(&client_order_id);
+            return Err(EngineError::CapacityExhausted {
+                storage: "inflight-placement lifecycle slots",
+            });
+        }
+        Ok(())
+    }
+
     fn schedule_cancel(
         &mut self,
         commands: &mut FuturesUnordered<CommandFuture>,
         client_order_id: ClientOrderId,
         kind: CancellationKind,
-    ) {
-        self.inflight_cancels.insert(client_order_id);
+    ) -> Result<(), EngineError> {
+        self.inflight_cancels
+            .insert(client_order_id)
+            .map_err(|()| EngineError::CapacityExhausted {
+                storage: "inflight cancel lifecycle slots",
+            })?;
         let symbol = *self.config.symbol();
         let request = self.exchange.cancel_order(symbol, client_order_id);
         commands.push(
@@ -670,6 +742,7 @@ impl MakerEngine {
             }
             .boxed(),
         );
+        Ok(())
     }
 
     fn schedule_instrument_refresh(&mut self, commands: &mut FuturesUnordered<CommandFuture>) {
@@ -770,7 +843,11 @@ impl MakerEngine {
                 let may_exist = placement_may_exist(error.kind())
                     || self.pre_ack_updates.contains_key(&client_order_id);
                 if may_exist {
-                    self.unresolved_attempts.insert(client_order_id);
+                    self.unresolved_attempts
+                        .insert(client_order_id)
+                        .map_err(|()| EngineError::CapacityExhausted {
+                            storage: "unresolved-placement lifecycle slots",
+                        })?;
                 } else {
                     self.placement_attempts.remove(&client_order_id);
                     self.pre_ack_updates.remove(&client_order_id);
@@ -779,7 +856,17 @@ impl MakerEngine {
                 if engine_error.exchange_is_fatal() {
                     return Err(engine_error);
                 }
-                self.deferred_placements.insert(level);
+                if !self
+                    .deferred_placements
+                    .iter()
+                    .any(|candidate| candidate.same_order(level))
+                {
+                    self.deferred_placements.push(level).map_err(|()| {
+                        EngineError::CapacityExhausted {
+                            storage: "deferred placement levels",
+                        }
+                    })?;
+                }
             }
         }
         Ok(())
@@ -826,32 +913,48 @@ impl MakerEngine {
                 if engine_error.exchange_is_fatal() {
                     return Err(engine_error);
                 }
-                self.deferred_cancels.insert(client_order_id);
+                self.deferred_cancels
+                    .insert(client_order_id)
+                    .map_err(|()| EngineError::CapacityExhausted {
+                        storage: "deferred-cancel lifecycle slots",
+                    })?;
             }
         }
         Ok(())
     }
 
-    fn desired_levels(&self) -> Vec<GridLevel> {
+    fn desired_levels(&self) -> FixedVec<GridLevel, MAX_GRID_LEVELS> {
         let grid = self
             .grid
             .as_ref()
             .expect("reconcile is only called after grid initialization");
-        let bids = grid.levels(Side::Buy);
-        let asks = grid.levels(Side::Sell);
-        let mut levels = Vec::with_capacity(bids.len() + asks.len());
-        for (bid, ask) in bids.into_iter().zip(asks) {
-            levels.push(bid);
-            levels.push(ask);
+        let mut levels = FixedVec::default();
+        let mut bids = FixedVec::<GridLevel, { crate::storage::MAX_LEVELS_PER_SIDE }>::default();
+        let mut asks = FixedVec::<GridLevel, { crate::storage::MAX_LEVELS_PER_SIDE }>::default();
+        grid.for_each_level(Side::Buy, |level| {
+            bids.push(level)
+                .expect("validated buy grid fits configured capacity");
+        });
+        grid.for_each_level(Side::Sell, |level| {
+            asks.push(level)
+                .expect("validated sell grid fits configured capacity");
+        });
+        for index in 0..bids.len() {
+            levels
+                .push(*bids.get(index).expect("bid index is initialized"))
+                .expect("validated grid fits desired-level capacity");
+            levels
+                .push(*asks.get(index).expect("ask index is initialized"))
+                .expect("validated grid fits desired-level capacity");
         }
         levels
     }
 
     fn next_missing_level(
         &self,
-        desired_levels: &[GridLevel],
-        pending_levels: &[GridLevel],
-        failed: &HashSet<GridLevel>,
+        desired_levels: &FixedVec<GridLevel, MAX_GRID_LEVELS>,
+        pending_levels: &FixedVec<GridLevel, MAX_GRID_LEVELS>,
+        failed: &FixedVec<GridLevel, MAX_GRID_LEVELS>,
     ) -> Option<GridLevel> {
         let max_per_side = self.config.levels_per_side().get();
         let can_place = |level: GridLevel| {
@@ -859,7 +962,7 @@ impl MakerEngine {
                 && !pending_levels
                     .iter()
                     .any(|pending| pending.same_order(level))
-                && !failed.contains(&level)
+                && !failed.iter().any(|failed| failed.same_order(level))
                 && self.effective_side_count(level.side()) < max_per_side
                 && self.level_would_rest(level)
         };
@@ -879,8 +982,7 @@ impl MakerEngine {
     fn effective_side_count(&self, side: Side) -> usize {
         let active = self
             .registry
-            .active_orders()
-            .into_iter()
+            .active_iter()
             .filter(|order| {
                 order.level().side() == side
                     && !self.inflight_cancels.contains(order.client_order_id())
@@ -931,13 +1033,37 @@ impl MakerEngine {
     }
 
     fn next_client_order_id(&mut self) -> Result<ClientOrderId, EngineError> {
-        if self.next_order_sequence == CLIENT_SEQUENCE_MAX {
-            return Err(EngineError::OrderSequenceOverflow);
+        for _ in 0..LIFECYCLE_CAPACITY {
+            if self.next_order_sequence == CLIENT_SEQUENCE_MAX {
+                return Err(EngineError::OrderSequenceOverflow);
+            }
+            self.next_order_sequence += 1;
+            let value = (self.current_client_id_prefix() << CLIENT_GENERATION_SHIFT)
+                | u64::from(self.next_order_sequence);
+            let client_order_id = ClientOrderId::new(value)?;
+            if !self.lifecycle_slot_occupied(&client_order_id) {
+                return Ok(client_order_id);
+            }
         }
-        self.next_order_sequence += 1;
-        let value = (self.current_client_id_prefix() << CLIENT_GENERATION_SHIFT)
-            | u64::from(self.next_order_sequence);
-        ClientOrderId::new(value).map_err(Into::into)
+        Err(EngineError::CapacityExhausted {
+            storage: "client-order lifecycle slots",
+        })
+    }
+
+    fn lifecycle_slot_occupied(&self, candidate: &ClientOrderId) -> bool {
+        let low_byte = candidate.get() & 0xff;
+        self.registry
+            .active_iter()
+            .map(|order| *order.client_order_id())
+            .chain(self.placement_attempts.keys())
+            .chain(self.pending_fills.keys())
+            .chain(self.inflight_placements.iter())
+            .chain(self.filled_before_ack.iter())
+            .chain(self.pre_ack_updates.keys())
+            .chain(self.unresolved_attempts.iter())
+            .chain(self.inflight_cancels.iter())
+            .chain(self.deferred_cancels.iter())
+            .any(|id| id.get() & 0xff == low_byte)
     }
 
     fn current_level_for(&self, candidate: GridLevel) -> GridLevel {
@@ -950,9 +1076,6 @@ impl MakerEngine {
 
     fn finish_fill(&mut self, client_order_id: &ClientOrderId) {
         self.registry.discard(client_order_id);
-        if self.inflight_placements.contains(client_order_id) {
-            self.filled_before_ack.insert(*client_order_id);
-        }
         self.placement_attempts.remove(client_order_id);
         self.pre_ack_updates.remove(client_order_id);
         self.unresolved_attempts.remove(client_order_id);
@@ -966,33 +1089,33 @@ impl MakerEngine {
     /// fill is fed through the same grid state machine; an unconfirmed result
     /// stops recovery instead of silently resuming quotes.
     async fn recover_stream_loss(&mut self) -> Result<(), EngineError> {
-        let mut client_order_ids: Vec<_> = self
-            .registry
-            .active_orders()
-            .into_iter()
-            .map(|order| *order.client_order_id())
-            .collect();
-        client_order_ids.extend(self.placement_attempts.keys().cloned());
-        client_order_ids.extend(self.pending_fills.keys().cloned());
-        client_order_ids.extend(self.unresolved_attempts.iter().cloned());
-        client_order_ids.extend(
-            self.inflight_placements
-                .iter()
-                .filter(|client_order_id| !self.filled_before_ack.contains(*client_order_id))
-                .cloned(),
-        );
-        client_order_ids.extend(
-            self.inflight_cancels
-                .iter()
-                .filter(|client_order_id| !self.filled_before_ack.contains(*client_order_id))
-                .cloned(),
-        );
-        // `filled_before_ack` entries already advanced the grid and cannot
-        // represent a live order; the dropped placement ACK needs no replay.
-        client_order_ids.sort();
-        client_order_ids.dedup();
-
-        for client_order_id in client_order_ids {
+        let mut resolved = IdSet::default();
+        loop {
+            let client_order_id =
+                self.registry
+                    .active_iter()
+                    .map(|order| *order.client_order_id())
+                    .chain(self.placement_attempts.keys())
+                    .chain(self.pending_fills.keys())
+                    .chain(self.unresolved_attempts.iter())
+                    .chain(self.inflight_placements.iter().filter(|client_order_id| {
+                        !self.filled_before_ack.contains(client_order_id)
+                    }))
+                    .chain(self.inflight_cancels.iter().filter(|client_order_id| {
+                        !self.filled_before_ack.contains(client_order_id)
+                    }))
+                    .filter(|client_order_id| !resolved.contains(client_order_id))
+                    .min();
+            let Some(client_order_id) = client_order_id else {
+                break;
+            };
+            resolved
+                .insert(client_order_id)
+                .map_err(|()| EngineError::CapacityExhausted {
+                    storage: "recovery resolved lifecycle slots",
+                })?;
+            // `filled_before_ack` entries already advanced the grid and cannot
+            // represent a live order; the dropped placement ACK needs no replay.
             if self.known_level(&client_order_id).is_none() {
                 return Err(EngineError::AdapterContract(format!(
                     "cannot resolve recovery order {client_order_id}: local level is unknown"
@@ -1107,6 +1230,24 @@ impl MakerEngine {
         self.latest_book = None;
         result
     }
+}
+
+fn contains_level(levels: &FixedVec<GridLevel, MAX_GRID_LEVELS>, candidate: GridLevel) -> bool {
+    levels.iter().any(|level| level.same_order(candidate))
+}
+
+fn push_unique_level(
+    levels: &mut FixedVec<GridLevel, MAX_GRID_LEVELS>,
+    candidate: GridLevel,
+) -> Result<(), EngineError> {
+    if !contains_level(levels, candidate) {
+        levels
+            .push(candidate)
+            .map_err(|()| EngineError::CapacityExhausted {
+                storage: "reconcile level scratch",
+            })?;
+    }
+    Ok(())
 }
 
 fn is_deferrable_fill(error: &GridError) -> bool {

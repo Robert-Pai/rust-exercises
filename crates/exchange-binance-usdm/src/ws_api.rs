@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use maker_domain::{ClientOrderId, InstrumentSpec, OrderIntent, Side, Symbol};
@@ -26,6 +23,8 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Parameters = BTreeMap<String, Value>;
 
 const COMMAND_BUFFER: usize = 256;
+const TRANSPORT_ID_SLOTS: usize = 256;
+const TRANSPORT_ID_MASK: u64 = (TRANSPORT_ID_SLOTS as u64) - 1;
 
 /// Move-only strategy-side producer for one persistent trading WebSocket worker.
 pub(crate) struct WsApiClient {
@@ -39,6 +38,7 @@ struct WorkerConfig {
     clock: RestClient,
     recv_window_ms: u64,
     connect_timeout: Duration,
+    response_timeout: Duration,
 }
 
 struct WorkerState {
@@ -50,6 +50,7 @@ struct Command {
     parameters: Parameters,
     mode: ResponseMode,
     clock_retried: bool,
+    deadline: tokio::time::Instant,
     reply: oneshot::Sender<ExchangeResult<Value>>,
 }
 
@@ -61,11 +62,20 @@ enum ResponseMode {
 }
 
 struct PendingRequest {
+    id: u64,
+    deadline: tokio::time::Instant,
     method: &'static str,
     mode: ResponseMode,
     parameters: Parameters,
     clock_retried: bool,
     reply: oneshot::Sender<ExchangeResult<Value>>,
+}
+
+type PendingSlots = [Option<PendingRequest>; TRANSPORT_ID_SLOTS];
+
+enum DispatchOutcome {
+    Continue,
+    Reset(ExchangeError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +110,7 @@ impl WsApiClient {
                 clock,
                 recv_window_ms,
                 connect_timeout: config.request_timeout(),
+                response_timeout: config.request_timeout(),
             },
             receiver,
         ))?;
@@ -219,28 +230,24 @@ impl WsApiClient {
         mode: ResponseMode,
     ) -> ExchangeFuture<Value> {
         let (reply, response) = oneshot::channel();
-        if let Err(error) = self.commands.try_push(Command {
+        let command = Command {
             method,
             parameters,
             mode,
             clock_retried: false,
+            deadline: tokio::time::Instant::now() + self.response_timeout,
             reply,
-        }) {
+        };
+        if let Err(error) = self.commands.try_push(command) {
             return ready_error(command_enqueue_error(error));
         }
-        let response_timeout = self.response_timeout;
         Box::pin(async move {
-            match tokio::time::timeout(response_timeout, response).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(ExchangeError::new(
+            response.await.unwrap_or_else(|_| {
+                Err(ExchangeError::new(
                     ExchangeErrorKind::Network,
                     "Binance WebSocket API response channel closed",
-                )),
-                Err(_) => Err(ExchangeError::new(
-                    ExchangeErrorKind::Timeout,
-                    "Binance WebSocket API response timed out",
-                )),
-            }
+                ))
+            })
         })
     }
 }
@@ -264,7 +271,7 @@ fn command_enqueue_error(error: TryPushError<Command>) -> ExchangeError {
 
 async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
     let mut socket = None;
-    let mut pending = HashMap::new();
+    let mut pending: PendingSlots = std::array::from_fn(|_| None);
     let mut next_request_id = 1_u64;
     let mut state = WorkerState {
         clock_offset_ms: None,
@@ -275,9 +282,19 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
             let Some(command) = commands.recv().await else {
                 return;
             };
-            match connect(&config.endpoint, config.connect_timeout).await {
+            if command_is_inactive(&command) {
+                finish_inactive(command);
+                continue;
+            }
+            let connect_timeout = remaining(command.deadline).unwrap_or(Duration::ZERO);
+            match connect(
+                &config.endpoint,
+                connect_timeout.min(config.connect_timeout),
+            )
+            .await
+            {
                 Ok(mut connected) => {
-                    if dispatch(
+                    match dispatch(
                         &mut connected,
                         &mut pending,
                         &mut next_request_id,
@@ -287,7 +304,8 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     )
                     .await
                     {
-                        socket = Some(connected);
+                        DispatchOutcome::Continue => socket = Some(connected),
+                        DispatchOutcome::Reset(error) => fail_pending(&mut pending, error),
                     }
                 }
                 Err(error) => {
@@ -300,12 +318,24 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
         let connected = socket
             .as_mut()
             .expect("WebSocket API socket was checked above");
+        let deadline = next_pending_deadline(&pending);
         tokio::select! {
-            command = commands.recv() => {
+            command = commands.recv(), if pending_count(&pending) < TRANSPORT_ID_SLOTS => {
                 let Some(command) = command else {
+                    fail_pending(
+                        &mut pending,
+                        ExchangeError::new(
+                            ExchangeErrorKind::ServiceUnavailable,
+                            "Binance WebSocket API worker stopped",
+                        ),
+                    );
                     return;
                 };
-                if !dispatch(
+                if command_is_inactive(&command) {
+                    finish_inactive(command);
+                    continue;
+                }
+                if let DispatchOutcome::Reset(error) = dispatch(
                     connected,
                     &mut pending,
                     &mut next_request_id,
@@ -313,13 +343,7 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     &mut state,
                     command,
                 ).await {
-                    fail_pending(
-                        &mut pending,
-                        ExchangeError::new(
-                            ExchangeErrorKind::Network,
-                            "Binance WebSocket API connection was lost while sending",
-                        ),
-                    );
+                    fail_pending(&mut pending, error);
                     socket = None;
                 }
             }
@@ -330,24 +354,65 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     &mut next_request_id,
                     &config,
                     &mut state,
+                    write_timeout(deadline, config.response_timeout),
                     message,
                 ).await {
                     fail_pending(&mut pending, error);
                     socket = None;
                 }
             }
+            () = wait_for_deadline(deadline) => {
+                expire_pending(&mut pending, tokio::time::Instant::now());
+            }
         }
+    }
+}
+
+fn command_is_inactive(command: &Command) -> bool {
+    command.reply.is_closed() || remaining(command.deadline).is_none()
+}
+
+fn finish_inactive(command: Command) {
+    if !command.reply.is_closed() {
+        let _ = command.reply.send(Err(response_timeout_error()));
+    }
+}
+
+fn remaining(deadline: tokio::time::Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn write_timeout(deadline: Option<tokio::time::Instant>, fallback: Duration) -> Duration {
+    deadline
+        .and_then(remaining)
+        .map_or(fallback, |remaining| remaining.min(fallback))
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
 async fn dispatch(
     socket: &mut Socket,
-    pending: &mut HashMap<u64, PendingRequest>,
+    pending: &mut PendingSlots,
     next_request_id: &mut u64,
     config: &WorkerConfig,
     state: &mut WorkerState,
     command: Command,
-) -> bool {
+) -> DispatchOutcome {
+    let deadline = command.deadline;
+    if command.reply.is_closed() {
+        return DispatchOutcome::Continue;
+    }
+    if remaining(deadline).is_none() {
+        let _ = command.reply.send(Err(response_timeout_error()));
+        return DispatchOutcome::Continue;
+    }
     let clock_offset_ms = match state.clock_offset_ms {
         Some(offset) => offset,
         None => match config.clock.clock_offset_ms().await {
@@ -357,12 +422,29 @@ async fn dispatch(
             }
             Err(error) => {
                 let _ = command.reply.send(Err(error));
-                return true;
+                return DispatchOutcome::Continue;
             }
         },
     };
-    let id = *next_request_id;
-    *next_request_id = next_request_id.wrapping_add(1);
+    if command.reply.is_closed() {
+        return DispatchOutcome::Continue;
+    }
+    if remaining(deadline).is_none() {
+        let _ = command.reply.send(Err(response_timeout_error()));
+        return DispatchOutcome::Continue;
+    }
+
+    let id = next_transport_id(next_request_id);
+    let slot = transport_slot(id);
+    if pending[slot].is_some() {
+        let error = ExchangeError::new(
+            ExchangeErrorKind::StateConflict,
+            "Binance WebSocket API transport slot was occupied below capacity",
+        );
+        let _ = command.reply.send(Err(error.clone()));
+        return DispatchOutcome::Reset(error);
+    }
+
     let mode = command.mode;
     let method = command.method;
     let recovery_parameters = command.parameters.clone();
@@ -376,7 +458,7 @@ async fn dispatch(
         Ok(timestamp) => timestamp,
         Err(error) => {
             let _ = command.reply.send(Err(error));
-            return true;
+            return DispatchOutcome::Continue;
         }
     };
     signed.insert("timestamp".to_owned(), json!(timestamp));
@@ -384,7 +466,7 @@ async fn dispatch(
         Ok(payload) => payload,
         Err(error) => {
             let _ = command.reply.send(Err(error));
-            return true;
+            return DispatchOutcome::Continue;
         }
     };
     signed.insert(
@@ -401,40 +483,39 @@ async fn dispatch(
             let _ = command
                 .reply
                 .send(Err(error::invalid_response("WebSocket API request", error)));
-            return true;
+            return DispatchOutcome::Continue;
         }
     };
-    if socket.send(Message::Text(payload.into())).await.is_err() {
-        let _ = command.reply.send(Err(ExchangeError::new(
+
+    pending[slot] = Some(PendingRequest {
+        id,
+        deadline,
+        method,
+        mode,
+        parameters: recovery_parameters,
+        clock_retried: command.clock_retried,
+        reply: command.reply,
+    });
+    let Some(send_timeout) = remaining(deadline) else {
+        return DispatchOutcome::Reset(response_timeout_error());
+    };
+    match tokio::time::timeout(send_timeout, socket.send(Message::Text(payload.into()))).await {
+        Ok(Ok(())) => DispatchOutcome::Continue,
+        Ok(Err(_)) => DispatchOutcome::Reset(ExchangeError::new(
             ExchangeErrorKind::Network,
             "Binance WebSocket API request send failed",
-        )));
-        return false;
+        )),
+        Err(_) => DispatchOutcome::Reset(response_timeout_error()),
     }
-    if let Some(previous) = pending.insert(
-        id,
-        PendingRequest {
-            method,
-            mode,
-            parameters: recovery_parameters,
-            clock_retried: command.clock_retried,
-            reply: command.reply,
-        },
-    ) {
-        let _ = previous.reply.send(Err(ExchangeError::new(
-            ExchangeErrorKind::StateConflict,
-            "duplicate Binance WebSocket API request ID",
-        )));
-    }
-    true
 }
 
 async fn handle_message(
     socket: &mut Socket,
-    pending: &mut HashMap<u64, PendingRequest>,
+    pending: &mut PendingSlots,
     next_request_id: &mut u64,
     config: &WorkerConfig,
     state: &mut WorkerState,
+    write_timeout: Duration,
     message: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
 ) -> Option<ExchangeError> {
     match message {
@@ -445,32 +526,56 @@ async fn handle_message(
                     return Some(error::invalid_response("WebSocket API response", error));
                 }
             };
-            let request = pending.remove(&response.id)?;
+            let request = take_pending(pending, response.id)?;
+            if request.reply.is_closed() {
+                return None;
+            }
+            if remaining(request.deadline).is_none() {
+                let _ = request.reply.send(Err(response_timeout_error()));
+                return None;
+            }
             if !request.clock_retried
                 && response
                     .error
                     .as_ref()
                     .is_some_and(|error| error.code == -1021)
             {
-                state.clock_offset_ms = match config.clock.clock_offset_ms().await {
-                    Ok(offset) => Some(offset),
-                    Err(error) => {
-                        let _ = request.reply.send(Err(error));
-                        return None;
-                    }
+                fail_pending(
+                    pending,
+                    ExchangeError::new(
+                        ExchangeErrorKind::ServiceUnavailable,
+                        "Binance WebSocket API clock resynchronization interrupted pending requests",
+                    ),
+                );
+                let Some(clock_timeout) = remaining(request.deadline) else {
+                    let _ = request.reply.send(Err(response_timeout_error()));
+                    return None;
                 };
+                state.clock_offset_ms =
+                    match tokio::time::timeout(clock_timeout, config.clock.clock_offset_ms()).await
+                    {
+                        Ok(Ok(offset)) => Some(offset),
+                        Ok(Err(error)) => {
+                            let _ = request.reply.send(Err(error));
+                            return None;
+                        }
+                        Err(_) => {
+                            let _ = request.reply.send(Err(response_timeout_error()));
+                            return None;
+                        }
+                    };
                 let command = Command {
                     method: request.method,
                     parameters: request.parameters,
                     mode: request.mode,
                     clock_retried: true,
+                    deadline: request.deadline,
                     reply: request.reply,
                 };
-                if !dispatch(socket, pending, next_request_id, config, state, command).await {
-                    return Some(ExchangeError::new(
-                        ExchangeErrorKind::Network,
-                        "Binance WebSocket API connection was lost during clock retry",
-                    ));
+                if let DispatchOutcome::Reset(error) =
+                    dispatch(socket, pending, next_request_id, config, state, command).await
+                {
+                    return Some(error);
                 }
                 return None;
             }
@@ -485,19 +590,27 @@ async fn handle_message(
                     parameters: request.parameters,
                     mode: ResponseMode::CancelQuery,
                     clock_retried: request.clock_retried,
+                    deadline: request.deadline,
                     reply: request.reply,
                 };
-                if !dispatch(socket, pending, next_request_id, config, state, command).await {
-                    return Some(ExchangeError::new(
-                        ExchangeErrorKind::Network,
-                        "Binance WebSocket API connection was lost during cancel recovery",
-                    ));
+                if let DispatchOutcome::Reset(error) =
+                    dispatch(socket, pending, next_request_id, config, state, command).await
+                {
+                    return Some(error);
                 }
                 return None;
             }
 
             let result = if (200..300).contains(&response.status) {
-                Ok(response.result.unwrap_or(Value::Null))
+                response.result.ok_or_else(|| {
+                    ExchangeError::new(
+                        ExchangeErrorKind::InvalidResponse,
+                        format!(
+                            "Binance WebSocket API returned status {} without a result body",
+                            response.status
+                        ),
+                    )
+                })
             } else if matches!(request.mode, ResponseMode::CancelQuery)
                 && response
                     .error
@@ -520,13 +633,16 @@ async fn handle_message(
             None
         }
         Some(Ok(Message::Ping(payload))) => {
-            if socket.send(Message::Pong(payload)).await.is_err() {
-                Some(ExchangeError::new(
+            match tokio::time::timeout(write_timeout, socket.send(Message::Pong(payload))).await {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => Some(ExchangeError::new(
                     ExchangeErrorKind::Network,
                     "Binance WebSocket API pong send failed",
-                ))
-            } else {
-                None
+                )),
+                Err(_) => Some(ExchangeError::new(
+                    ExchangeErrorKind::Timeout,
+                    "Binance WebSocket API pong send timed out",
+                )),
             }
         }
         Some(Ok(Message::Close(_))) | None => Some(ExchangeError::new(
@@ -551,9 +667,66 @@ async fn connect(endpoint: &str, timeout: Duration) -> ExchangeResult<Socket> {
     Ok(connection.0)
 }
 
-fn fail_pending(pending: &mut HashMap<u64, PendingRequest>, error: ExchangeError) {
-    for (_, request) in pending.drain() {
-        let _ = request.reply.send(Err(error.clone()));
+fn next_transport_id(next_request_id: &mut u64) -> u64 {
+    if *next_request_id == 0 {
+        *next_request_id = 1;
+    }
+    let id = *next_request_id;
+    *next_request_id = next_request_id.wrapping_add(1);
+    if *next_request_id == 0 {
+        *next_request_id = 1;
+    }
+    id
+}
+
+fn pending_count(pending: &PendingSlots) -> usize {
+    pending.iter().filter(|slot| slot.is_some()).count()
+}
+
+fn transport_slot(id: u64) -> usize {
+    usize::try_from(id & TRANSPORT_ID_MASK).expect("transport slot fits usize")
+}
+
+fn take_pending(pending: &mut PendingSlots, id: u64) -> Option<PendingRequest> {
+    let slot = transport_slot(id);
+    pending[slot]
+        .as_ref()
+        .is_some_and(|request| request.id == id)
+        .then(|| {
+            pending[slot]
+                .take()
+                .expect("validated request slot is occupied")
+        })
+}
+
+fn next_pending_deadline(pending: &PendingSlots) -> Option<tokio::time::Instant> {
+    pending
+        .iter()
+        .filter_map(|request| request.as_ref().map(|request| request.deadline))
+        .min()
+}
+
+fn expire_pending(pending: &mut PendingSlots, now: tokio::time::Instant) {
+    for slot in pending.iter_mut() {
+        if slot.as_ref().is_some_and(|request| request.deadline <= now) {
+            let request = slot.take().expect("expired request slot is occupied");
+            let _ = request.reply.send(Err(response_timeout_error()));
+        }
+    }
+}
+
+fn response_timeout_error() -> ExchangeError {
+    ExchangeError::new(
+        ExchangeErrorKind::Timeout,
+        "Binance WebSocket API response timed out",
+    )
+}
+
+fn fail_pending(pending: &mut PendingSlots, error: ExchangeError) {
+    for slot in pending.iter_mut() {
+        if let Some(request) = slot.take() {
+            let _ = request.reply.send(Err(error.clone()));
+        }
     }
 }
 

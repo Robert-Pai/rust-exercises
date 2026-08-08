@@ -4,6 +4,8 @@ use maker_domain::{NonZeroTickCount, Symbol, ValueError};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
+use crate::storage::MAX_LEVELS_PER_SIDE;
+
 /// Runtime and strategy parameters needed by the rolling-grid engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineConfig {
@@ -33,6 +35,12 @@ impl EngineConfig {
     ) -> Result<Self, EngineConfigError> {
         let levels_per_side =
             NonZeroUsize::new(levels_per_side).ok_or(EngineConfigError::ZeroLevels)?;
+        if levels_per_side.get() > MAX_LEVELS_PER_SIDE {
+            return Err(EngineConfigError::TooManyLevels {
+                requested: levels_per_side.get(),
+                maximum: MAX_LEVELS_PER_SIDE,
+            });
+        }
         let inner_ticks =
             NonZeroTickCount::new(inner_ticks).map_err(EngineConfigError::DomainValue)?;
         let spacing_ticks =
@@ -107,6 +115,9 @@ pub enum EngineConfigError {
     #[error("levels per side must be greater than zero")]
     ZeroLevels,
 
+    #[error("levels per side must be at most {maximum}, got {requested}")]
+    TooManyLevels { requested: usize, maximum: usize },
+
     #[error("quantity must be greater than zero, got {0}")]
     NonPositiveQuantity(Decimal),
 
@@ -132,6 +143,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_maximum_levels_per_side() {
+        let config = EngineConfig::new(
+            symbol(),
+            MAX_LEVELS_PER_SIDE,
+            1,
+            1,
+            1,
+            Decimal::ONE,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(config.levels_per_side().get(), MAX_LEVELS_PER_SIDE);
+    }
+
+    #[test]
     fn rejects_zero_values() {
         assert!(matches!(
             EngineConfig::new(
@@ -146,6 +175,23 @@ mod tests {
                 Duration::from_secs(1),
             ),
             Err(EngineConfigError::ZeroLevels)
+        ));
+        assert!(matches!(
+            EngineConfig::new(
+                symbol(),
+                MAX_LEVELS_PER_SIDE + 1,
+                1,
+                1,
+                1,
+                Decimal::ONE,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(EngineConfigError::TooManyLevels {
+                requested,
+                maximum: MAX_LEVELS_PER_SIDE,
+            }) if requested == MAX_LEVELS_PER_SIDE + 1
         ));
         assert!(matches!(
             EngineConfig::new(

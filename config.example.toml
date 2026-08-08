@@ -18,6 +18,7 @@ websocket_idle_timeout_secs = 240
 
 [strategy]
 symbol = "BTCUSDT"
+# Fixed engine storage supports 1 through 64 levels per side.
 levels_per_side = 5
 inner_ticks = 10
 spacing_ticks = 5

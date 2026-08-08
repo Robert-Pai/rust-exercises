@@ -10,6 +10,7 @@ mod config;
 mod engine;
 mod error;
 mod registry;
+mod storage;
 
 pub use config::{EngineConfig, EngineConfigError};
 pub use engine::{EnginePhase, MakerEngine};

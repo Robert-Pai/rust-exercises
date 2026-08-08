@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-
 use maker_domain::{ClientOrderId, ExchangeOrderId, GridLevel, OrderStatus, OrderUpdate, Symbol};
 use maker_ports::PlaceOrderAck;
 use thiserror::Error;
+
+use crate::storage::IdMap;
 
 /// Whether an exchange order still contributes to the live side count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +51,7 @@ impl RegisteredOrder {
 /// Actual exchange orders known to the current engine session.
 #[derive(Debug, Default)]
 pub struct OrderRegistry {
-    orders: HashMap<ClientOrderId, RegisteredOrder>,
+    orders: IdMap<RegisteredOrder>,
 }
 
 impl OrderRegistry {
@@ -71,31 +71,29 @@ impl OrderRegistry {
         self.orders.get(client_order_id)
     }
 
-    pub fn active_orders(&self) -> Vec<&RegisteredOrder> {
-        self.orders
-            .values()
-            .filter(|order| order.state == RegistryState::Active)
-            .collect()
+    pub fn active_orders(&self) -> impl Iterator<Item = &RegisteredOrder> {
+        self.active_iter()
     }
 
-    pub fn active_levels(&self) -> Vec<GridLevel> {
-        self.active_orders()
-            .into_iter()
-            .map(RegisteredOrder::level)
-            .collect()
+    pub fn active_levels(&self) -> impl Iterator<Item = GridLevel> + '_ {
+        self.active_iter().map(RegisteredOrder::level)
+    }
+
+    pub(crate) fn active_iter(&self) -> impl Iterator<Item = &RegisteredOrder> {
+        self.orders
+            .iter()
+            .filter_map(|(_, order)| (order.state == RegistryState::Active).then_some(order))
     }
 
     pub fn active_count(&self, side: maker_domain::Side) -> usize {
-        self.orders
-            .values()
-            .filter(|order| order.state == RegistryState::Active && order.level.side() == side)
+        self.active_iter()
+            .filter(|order| order.level.side() == side)
             .count()
     }
 
     pub fn has_active_level(&self, level: GridLevel) -> bool {
-        self.orders
-            .values()
-            .any(|order| order.state == RegistryState::Active && order.level.same_order(level))
+        self.active_iter()
+            .any(|order| order.level.same_order(level))
     }
 
     pub(crate) fn reassign_matching_level(
@@ -105,7 +103,8 @@ impl OrderRegistry {
     ) -> Result<Option<ClientOrderId>, RegistryError> {
         let client_order_id = self
             .orders
-            .values()
+            .iter()
+            .map(|(_, order)| order)
             .find(|order| order.state == RegistryState::Active && order.level.same_order(previous))
             .map(|order| order.client_order_id);
         let Some(client_order_id) = client_order_id else {
@@ -141,7 +140,11 @@ impl OrderRegistry {
             status: OrderStatus::Accepted,
             state: RegistryState::Active,
         };
-        self.orders.insert(order.client_order_id, order);
+        self.orders
+            .insert(order.client_order_id, order)
+            .map_err(|()| RegistryError::LifecycleSlotOccupied {
+                client_order_id: order.client_order_id,
+            })?;
         Ok(())
     }
 
@@ -209,6 +212,9 @@ impl OrderRegistry {
 pub enum RegistryError {
     #[error("client order ID {0} is already registered")]
     DuplicateClientOrderId(ClientOrderId),
+
+    #[error("lifecycle slot for client order ID {client_order_id} is occupied by another full ID")]
+    LifecycleSlotOccupied { client_order_id: ClientOrderId },
 
     #[error("an active order already represents {0:?}")]
     DuplicateActiveLevel(GridLevel),

@@ -118,6 +118,15 @@ order-event saturation drains accepted events and then forces stream recovery.
 Public BBO is intentionally different: the market thread writes a two-slot
 latest-value mailbox and strategy reads the newest coherent snapshot directly.
 
+The strategy supports 1–64 grid levels per side. Order lifecycle state uses 256
+fixed slots selected by the low byte of each engine-generated client order ID;
+every access also validates the complete ID, so slot reuse cannot accept stale
+events. Reconciliation and recovery reuse fixed inline scratch buffers, and
+capacity exhaustion never evicts lifecycle state—it stops new quoting and enters
+the existing recovery and symbol-wide cancellation path. The trading WebSocket
+worker independently uses 256 fixed transport-request slots because retries and
+cancel-all requests do not have a one-to-one client order ID.
+
 All three dedicated runtimes use the same busy-poll policy and therefore consume
 one CPU core continuously. The strategy, market-data, and trading CPU selectors are resolved by `core_affinity`; they should name separate logical
 CPUs. On a four-core Linux low-latency host, the example reserves core 1 for strategy,
