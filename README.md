@@ -30,8 +30,8 @@ failed order mutations. Order placement, single-order cancellation,
 symbol-wide cancellation, and uncertain-order lookup all use the Binance
 USD-M WebSocket API. REST is limited to exchange metadata, initial snapshots,
 position-mode validation, clock synchronization, and listen-key lifecycle.
-Exchange trading rules are loaded before the first grid is built. The adapter
-then serves them from a lock-free immutable snapshot; every
+Exchange trading rules are loaded before the first grid is built. The adapter then keeps the single configured instrument snapshot in the
+move-only strategy session; every
 `runtime.instrument_refresh_interval_secs` it fetches a candidate update. A
 rule change cancels the symbol orders and rebuilds the grid so old tick or step
 semantics cannot remain live.
@@ -64,12 +64,12 @@ orders, then rebuilds the subscriptions. Trading-rule changes still rebuild a
 fresh grid.
 
 Logs are written to the configured `logging.directory` (default `logs/`). The
-terminal receives compact text, while `maker.log.YYYY-MM-DD` files receive
-structured JSON through an asynchronous writer. Files older than
-`logging.retention_days` are removed when the process starts. Order IDs, sides,
-prices, quantities, fills, retries, recovery cancellations, and shutdown
-cancellations are recorded; API keys, private keys, and signatures are never
-logged.
+terminal receives compact control-plane text, while `maker.log.YYYY-MM-DD`
+files receive structured JSON through an asynchronous writer. Files older than
+`logging.retention_days` are removed when the process starts. Dedicated
+strategy and network runtime paths do not call tracing or perform synchronous
+output; lifecycle logging remains outside the covered low-latency boundary.
+API keys, private keys, and signatures are never logged.
 
 ## Run
 
@@ -98,28 +98,44 @@ listen-key keepalive, trading WebSocket API requests, and clock synchronization.
 Both share the same cloneable REST client state, but public market bursts cannot
 consume scheduler time on the latency-critical private/trading runtime.
 
-`runtime.market_data_mode` and `runtime.trading_mode` independently select
-`"event_driven"` or `"busy_spin"`. Event-driven runtimes park when no I/O or
-timer is ready. Busy-spin runtimes continuously self-wake so Tokio uses
-non-blocking driver polls instead of parking; this consumes one CPU core and can
-reduce local wake-up jitter, but it does not bypass Tokio, socket readiness, or
-the kernel TCP stack. `runtime.market_data_cpu_core` and
-`runtime.trading_cpu_core` independently select logical CPUs.
+Both network runtimes and the strategy runtime are always busy-polled. Project
+control flow therefore never selects an event-driven parking mode. Each runtime
+continuously self-wakes so Tokio uses non-blocking driver polls; this consumes
+one CPU core per dedicated thread and can reduce local wake-up jitter, but it
+does not bypass Tokio, socket readiness, or the kernel TCP stack.
+`runtime.market_data_cpu_core` and `runtime.trading_cpu_core` independently
+select logical CPUs.
 
 The engine owns a separate `maker-strategy` OS thread and a current-thread
-Tokio runtime. `runtime.strategy_mode = "event_driven"` lets that runtime park
-when idle. The default `"busy_spin"` mode self-wakes the runtime after every
-pending poll. Tokio therefore performs a non-blocking driver poll (I/O and
-timers) before polling the strategy again, instead of parking the thread; it
-consumes one CPU core continuously. The strategy, market-data, and trading CPU
-selectors are resolved by `core_affinity`; they should name separate logical
-CPUs. On a four-core low-latency host, the example reserves core 1 for strategy,
+Tokio runtime. Recurring FIFO communication between strategy and the two network
+threads uses fixed-capacity SPSC rings: capacity 64 for each network task inbox,
+capacity 256 for trading WebSocket API commands, and capacity 256 for ordered
+private order updates. The move-only exchange session directly owns each raw
+SPSC producer, so Rust ownership permits exactly one physical producer without
+locks or a runtime ownership guard. Queue saturation never
+blocks or overwrites: task/command admission fails immediately, while private
+order-event saturation drains accepted events and then forces stream recovery.
+Public BBO is intentionally different: the market thread writes a two-slot
+latest-value mailbox and strategy reads the newest coherent snapshot directly.
+
+All three dedicated runtimes use the same busy-poll policy and therefore consume
+one CPU core continuously. The strategy, market-data, and trading CPU selectors are resolved by `core_affinity`; they should name separate logical
+CPUs. On a four-core Linux low-latency host, the example reserves core 1 for strategy,
 core 2 for private trading, core 3 for public market data, and leaves core 0 for
 the OS, logging, and kernel network work. On Linux each selector indexes the
-CPUs allowed to the process and installs a hard single-CPU affinity mask. On
-macOS each value is translated to a nonzero Mach affinity tag; tags only express
-scheduler relationships and threads can still migrate, so the settings do not
-guarantee execution on specific physical or logical cores.
+CPUs allowed to the process and installs a hard single-CPU affinity mask. CPU
+affinity is rejected as unavailable on macOS because the project uses safe Rust
+only and Mach affinity tags do not provide hard CPU pinning.
+
+The no-blocking guarantee applies to project-owned production code executing on
+`maker-strategy`, `maker-network-market-data`, and `maker-network-trading`:
+there are no project mutexes, read/write locks, blocking waits, runtime parking
+modes, watch/MPSC control channels, or synchronous output calls on those paths.
+Bounded SPSC rings, atomics, `AtomicWaker`, bounded startup spinning, and
+asynchronous socket/HTTP I/O are permitted. Synchronization inside Tokio,
+reqwest/hyper, rustls, DNS, the allocator, the OS, and other dependencies is
+outside this project-owned proof boundary. A source-policy integration test
+rejects forbidden primitives in covered production modules.
 
 ## Verify
 

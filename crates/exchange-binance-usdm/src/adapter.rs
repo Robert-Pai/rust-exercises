@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
@@ -8,17 +8,14 @@ use crate::{
     websocket,
     ws_api::WsApiClient,
 };
-use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, OrderUpdate, Symbol};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult, InstrumentPort,
-    MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode, TradingPort,
+    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
+    InstrumentPort, LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck,
+    PositionMode, TradingPort,
 };
 
-/// Binance USD-M Futures adapter implementing all exchange ports used by the
-/// maker engine.
-#[derive(Clone)]
+/// Move-only Binance USD-M Futures session owned by the strategy thread.
 pub struct BinanceUsdm {
     rest: RestClient,
     market_network: NetworkRuntime,
@@ -28,24 +25,15 @@ pub struct BinanceUsdm {
     websocket_connect_timeout: Duration,
     websocket_idle_timeout: Duration,
     listen_key_keepalive: Duration,
-    instruments: Arc<ArcSwap<HashMap<Symbol, InstrumentSpec>>>,
+    instrument: Option<InstrumentSpec>,
 }
 
 impl BinanceUsdm {
     pub fn new(config: BinanceUsdmConfig, credentials: BinanceCredentials) -> ExchangeResult<Self> {
         let rest = RestClient::new(&config, credentials.clone())?;
-        let market_network = NetworkRuntime::new(
-            NetworkRole::MarketData,
-            config.market_data_mode(),
-            config.market_data_cpu_core(),
-        )?;
-        let trading_network = NetworkRuntime::new(
-            NetworkRole::Trading,
-            config.trading_mode(),
-            config.trading_cpu_core(),
-        )?;
-        let trading =
-            WsApiClient::new(&config, credentials, rest.clone(), trading_network.clone())?;
+        let market_network = NetworkRuntime::new(NetworkRole::MarketData, &config)?;
+        let mut trading_network = NetworkRuntime::new(NetworkRole::Trading, &config)?;
+        let trading = WsApiClient::new(&config, credentials, rest.clone(), &mut trading_network)?;
         Ok(Self {
             rest,
             market_network,
@@ -55,168 +43,163 @@ impl BinanceUsdm {
             websocket_connect_timeout: config.request_timeout(),
             websocket_idle_timeout: config.websocket_idle_timeout(),
             listen_key_keepalive: config.listen_key_keepalive(),
-            instruments: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            instrument: None,
         })
     }
 
     pub(crate) fn cached_instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
-        self.instruments.load().get(symbol).cloned().ok_or_else(|| {
-            ExchangeError::new(
-                ExchangeErrorKind::StateConflict,
-                format!("instrument specification for {symbol} was not initialized"),
-            )
-        })
+        self.instrument
+            .as_ref()
+            .filter(|spec| spec.symbol() == symbol)
+            .cloned()
+            .ok_or_else(|| {
+                ExchangeError::new(
+                    ExchangeErrorKind::StateConflict,
+                    format!("instrument specification for {symbol} was not initialized"),
+                )
+            })
     }
 
-    async fn load_instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
-        let rest = self.rest.clone();
-        let symbol_for_request = *symbol;
-        let wire = self
-            .market_network
-            .call(async move { rest.exchange_symbol(&symbol_for_request).await })
-            .await?;
-        let spec = mapping::instrument(symbol, wire)?;
-        self.replace_instrument_spec(spec.clone());
-        Ok(spec)
-    }
-
-    fn replace_instrument_spec(&self, spec: InstrumentSpec) {
-        let current = self.instruments.load_full();
-        let mut updated = (*current).clone();
-        updated.insert(*spec.symbol(), spec);
-        self.instruments.store(Arc::new(updated));
-    }
-
-    async fn recover_cancel(
-        &self,
-        symbol: &Symbol,
-        client_order_id: &ClientOrderId,
-        spec: &InstrumentSpec,
-    ) -> ExchangeResult<CancelOutcome> {
-        match self.trading.query_order(symbol, client_order_id).await {
-            Ok(order) => {
-                let update = mapping::ws_api_order(symbol, spec, order)?;
-                terminal_cancel_outcome(update)
-            }
-            Err(error) if error.exchange_code() == Some("-2013") => Ok(CancelOutcome::NotFound),
-            Err(error) => Err(error),
-        }
+    fn replace_instrument_spec(&mut self, spec: InstrumentSpec) {
+        self.instrument = Some(spec);
     }
 }
 
-#[async_trait]
 impl InstrumentPort for BinanceUsdm {
-    async fn instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
-        match self.cached_instrument_spec(symbol) {
-            Ok(spec) => Ok(spec),
-            Err(_) => self.load_instrument_spec(symbol).await,
+    fn start(&mut self) -> ExchangeResult<()> {
+        Ok(())
+    }
+
+    fn instrument_spec(&mut self, symbol: Symbol) -> ExchangeFuture<InstrumentSpec> {
+        if let Ok(spec) = self.cached_instrument_spec(&symbol) {
+            return Box::pin(async move { Ok(spec) });
         }
-    }
-
-    async fn refresh_instrument_spec(&self, symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
         let rest = self.rest.clone();
-        let symbol_for_request = *symbol;
-        let wire = self
-            .market_network
-            .call(async move { rest.exchange_symbol(&symbol_for_request).await })
-            .await?;
-        mapping::instrument(symbol, wire)
+        self.market_network.call(async move {
+            let wire = rest.exchange_symbol(&symbol).await?;
+            mapping::instrument(&symbol, wire)
+        })
     }
 
-    fn apply_instrument_spec(&self, spec: InstrumentSpec) -> ExchangeResult<()> {
+    fn refresh_instrument_spec(&mut self, symbol: Symbol) -> ExchangeFuture<InstrumentSpec> {
+        let rest = self.rest.clone();
+        self.market_network.call(async move {
+            let wire = rest.exchange_symbol(&symbol).await?;
+            mapping::instrument(&symbol, wire)
+        })
+    }
+
+    fn apply_instrument_spec(&mut self, spec: InstrumentSpec) -> ExchangeResult<()> {
         self.replace_instrument_spec(spec);
         Ok(())
     }
 
-    async fn position_mode(&self) -> ExchangeResult<PositionMode> {
+    fn position_mode(&mut self) -> ExchangeFuture<PositionMode> {
         let rest = self.rest.clone();
         self.trading_network
-            .call(async move { rest.position_mode().await })
-            .await
-            .map(mapping::position_mode)
+            .call(async move { rest.position_mode().await.map(mapping::position_mode) })
     }
 }
 
-#[async_trait]
 impl MarketDataPort for BinanceUsdm {
-    async fn best_bid_ask(&self, symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
-        let spec = self.cached_instrument_spec(symbol)?;
+    fn best_bid_ask(&mut self, symbol: Symbol) -> ExchangeFuture<BestBidAsk> {
+        let spec = self.cached_instrument_spec(&symbol);
         let rest = self.rest.clone();
-        let symbol_for_request = *symbol;
-        let wire = self
-            .market_network
-            .call(async move { rest.book_ticker(&symbol_for_request).await })
-            .await?;
-        mapping::rest_book(symbol, &spec, wire)
+        self.market_network.call(async move {
+            let spec = spec?;
+            let wire = rest.book_ticker(&symbol).await?;
+            mapping::rest_book(&symbol, &spec, wire)
+        })
     }
 
-    async fn subscribe_best_bid_ask(
-        &self,
-        symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<BestBidAsk>> {
-        let spec = self.cached_instrument_spec(symbol)?;
-        websocket::subscribe_book_ticker(
-            self.market_network.clone(),
-            &self.websocket_url,
-            *symbol,
-            spec,
-            self.websocket_connect_timeout,
-            self.websocket_idle_timeout,
-        )
-        .await
+    fn subscribe_best_bid_ask(
+        &mut self,
+        symbol: Symbol,
+        initial: BestBidAsk,
+    ) -> ExchangeFuture<LatestBboSubscription> {
+        let spec = self.cached_instrument_spec(&symbol);
+        let websocket_url = self.websocket_url.clone();
+        let connect_timeout = self.websocket_connect_timeout;
+        let idle_timeout = self.websocket_idle_timeout;
+        self.market_network.call(async move {
+            websocket::subscribe_book_ticker(
+                &websocket_url,
+                symbol,
+                spec?,
+                connect_timeout,
+                idle_timeout,
+                initial,
+            )
+            .await
+        })
     }
 }
 
-#[async_trait]
 impl TradingPort for BinanceUsdm {
-    async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
+    fn place_post_only(&mut self, intent: OrderIntent) -> ExchangeFuture<PlaceOrderAck> {
         let symbol = *intent.symbol();
         let client_order_id = *intent.client_order_id();
-        let spec = self.cached_instrument_spec(&symbol)?;
-        let wire = self.trading.place_order(&spec, &intent).await?;
-        mapping::ws_api_order_ack(&symbol, &client_order_id, wire)
+        let spec = match self.cached_instrument_spec(&symbol) {
+            Ok(spec) => spec,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let request = self.trading.place_order(&spec, &intent);
+        Box::pin(async move {
+            let wire = request.await?;
+            mapping::ws_api_order_ack(&symbol, &client_order_id, wire)
+        })
     }
 
-    async fn cancel_order(
-        &self,
-        symbol: &Symbol,
-        client_order_id: &ClientOrderId,
-    ) -> ExchangeResult<CancelOutcome> {
-        let spec = self.cached_instrument_spec(symbol)?;
-        match self.trading.cancel_order(symbol, client_order_id).await {
-            Ok(order) => {
-                let update = mapping::ws_api_order(symbol, &spec, order)?;
-                terminal_cancel_outcome(update)
+    fn cancel_order(
+        &mut self,
+        symbol: Symbol,
+        client_order_id: ClientOrderId,
+    ) -> ExchangeFuture<CancelOutcome> {
+        let spec = match self.cached_instrument_spec(&symbol) {
+            Ok(spec) => spec,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let cancel = self.trading.cancel_order(&symbol, &client_order_id);
+        Box::pin(async move {
+            match cancel.await {
+                Ok(Some(order)) => {
+                    let update = mapping::ws_api_order(&symbol, &spec, order)?;
+                    terminal_cancel_outcome(update)
+                }
+                Ok(None) => Ok(CancelOutcome::NotFound),
+                Err(error) => Err(error),
             }
-            Err(error) if matches!(error.exchange_code(), Some("-2011") | Some("-2013")) => {
-                self.recover_cancel(symbol, client_order_id, &spec).await
-            }
-            Err(error) => Err(error),
-        }
+        })
     }
 
-    async fn cancel_all(&self, symbol: &Symbol) -> ExchangeResult<()> {
-        self.trading.cancel_all(symbol).await
+    fn cancel_all(&mut self, symbol: Symbol) -> ExchangeFuture<()> {
+        self.trading.cancel_all(&symbol)
     }
 }
 
-#[async_trait]
 impl OrderEventPort for BinanceUsdm {
-    async fn subscribe_order_updates(
-        &self,
-        symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<OrderUpdate>> {
-        websocket::subscribe_order_updates(
-            self.trading_network.clone(),
-            self.clone(),
-            self.rest.clone(),
-            *symbol,
-            &self.websocket_url,
-            self.websocket_connect_timeout,
-            self.websocket_idle_timeout,
-            self.listen_key_keepalive,
-        )
-        .await
+    fn subscribe_order_updates(
+        &mut self,
+        symbol: Symbol,
+    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
+        let spec = self.cached_instrument_spec(&symbol);
+        let rest = self.rest.clone();
+        let websocket_url = self.websocket_url.clone();
+        let connect_timeout = self.websocket_connect_timeout;
+        let idle_timeout = self.websocket_idle_timeout;
+        let keepalive = self.listen_key_keepalive;
+        self.trading_network.call(async move {
+            websocket::subscribe_order_updates(
+                rest,
+                symbol,
+                spec?,
+                &websocket_url,
+                connect_timeout,
+                idle_timeout,
+                keepalive,
+            )
+            .await
+        })
     }
 }
 
@@ -292,7 +275,7 @@ mod tests {
             SecretString::new(crate::config::TEST_PRIVATE_KEY_PEM.to_owned()),
         )
         .unwrap();
-        let adapter = BinanceUsdm::new(BinanceUsdmConfig::default(), credentials).unwrap();
+        let mut adapter = BinanceUsdm::new(BinanceUsdmConfig::default(), credentials).unwrap();
         let symbol = Symbol::new("BTCUSDT").unwrap();
 
         assert_eq!(

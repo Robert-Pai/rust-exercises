@@ -28,16 +28,12 @@ quantity = "0.001"
 reconcile_interval_ms = 1000
 instrument_refresh_interval_secs = 3600
 reconnect_delay_ms = 1000
-strategy_mode = "busy_spin"
 # Zero-based selector resolved by core_affinity. Linux pins the thread to the
-# selected allowed logical CPU; macOS treats the value as a Mach affinity
-# hint/tag and may still migrate the thread.
+# selected allowed logical CPU. CPU affinity is unavailable on macOS.
 strategy_cpu_core = 1
 # Public book-ticker traffic is isolated on its own network thread.
-market_data_mode = "event_driven"
 market_data_cpu_core = 3
 # Private user-data and trading API traffic use the latency-prioritized thread.
-trading_mode = "busy_spin"
 trading_cpu_core = 2
 
 [logging]

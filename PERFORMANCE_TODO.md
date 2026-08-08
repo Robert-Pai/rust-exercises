@@ -32,10 +32,9 @@ Hot cached elements now use inline/numeric identities. The following dynamic con
 
 ## Adapter and trading runtime
 
-- `BinanceUsdm::instruments: ArcSwap<HashMap<Symbol, InstrumentSpec>>`
-  - Current deployment is single-symbol; logical bound is one.
-  - Candidate: `ArcSwapOption<InstrumentSpec>` or fixed array for future multi-symbol support.
-  - Decision needed: whether the adapter remains permanently single-symbol.
+- `BinanceUsdm::instrument: Option<InstrumentSpec>`
+  - The move-only adapter session is intentionally single-symbol, so the snapshot is stored directly without ArcSwap or a map.
+  - Multi-symbol support would require a separate ownership and capacity design rather than silently restoring shared cache state.
 
 - WebSocket API `pending: HashMap<u64, PendingRequest>`
   - Upper pressure is related to `COMMAND_BUFFER` (256), but timed-out `Forget` commands and reconnect handling must be included.
@@ -49,8 +48,11 @@ The engine creates temporary `Vec`/`HashSet` values for desired, unresolved, rec
 - Candidate: reusable scratch buffers owned by `MakerEngine`, preallocated from the validated maximum grid size.
 - Decision needed: maximum grid size and whether sorting/dedup can be replaced by sequence-indexed bitsets.
 
-## Cross-thread channels
+## Completed cross-thread paths
 
-- BBO stream: replace FIFO MPSC with a latest-value mailbox/seqlock because stale books should be overwritten.
-- Private order updates: replace MPSC with a bounded SPSC ring; queue full must trigger recovery, never overwrite.
-- Cache-line alignment should be applied to independently mutated producer/consumer indices and mailbox publication state, not to ordinary event structs.
+- Public BBO uses a cache-line-aligned, two-slot latest-value mailbox. The market-data thread is the single writer; strategy reads the newest coherent snapshot directly, and stale intermediate books are overwritten.
+- BBO wakeups use an atomic generation plus `AtomicWaker`; terminal health uses a capacity-one SPSC separate from snapshot storage, so strategy decisions do not wait for queued book payloads.
+- Market-data and trading runtime task inboxes are independent capacity-64 SPSC rings. One strategy OS thread owns their physical producers; each named network thread owns one consumer.
+- WebSocket API requests use a capacity-256 SPSC command ring from strategy to the persistent trading worker. Concurrent strategy futures share one thread-affine physical producer; per-request results remain one-shot replies.
+- Private order updates use a capacity-256 SPSC FIFO from the trading thread to strategy. Full capacity never overwrites lifecycle events: buffered updates drain first, then an out-of-band terminal error forces stream recovery.
+- Ring producer/consumer indices are cache-separated by the underlying SPSC implementation. Ordinary compact event values are not individually cache-line aligned.

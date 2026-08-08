@@ -2,13 +2,11 @@ use std::{future::Future, thread};
 
 use anyhow::{Context as _, Result, anyhow};
 use maker_engine::MakerEngine;
-use maker_runtime::{BusyPoll, ExecutionMode, bind_cpu};
+use maker_runtime::{BusyPoll, bind_cpu};
 use tokio::sync::oneshot;
-use tracing::info;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StrategyRuntimeSettings {
-    pub(crate) mode: ExecutionMode,
     pub(crate) cpu_core: Option<usize>,
 }
 
@@ -75,21 +73,11 @@ fn run(
         .enable_all()
         .build()
         .context("failed to build maker strategy runtime")?;
-    info!(
-        mode = ?settings.mode,
-        cpu_core = ?settings.cpu_core,
-        "maker strategy runtime started"
-    );
     let future = engine.run(async move {
         let _ = shutdown.await;
     });
 
-    match settings.mode {
-        ExecutionMode::EventDriven => runtime
-            .block_on(future)
-            .context("maker strategy engine failed"),
-        ExecutionMode::BusySpin => runtime
-            .block_on(BusyPoll::new(future))
-            .context("maker strategy engine failed"),
-    }
+    runtime
+        .block_on(BusyPoll::new(future))
+        .context("maker strategy engine failed")
 }

@@ -6,15 +6,15 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use maker_domain::{
     BestBidAsk, ClientOrderId, ExchangeOrderId, FilledLots, InstrumentSpec, MarketKind,
     OrderIntent, OrderStatus, OrderUpdate, PriceTicks, Side, Symbol,
 };
 use maker_engine::{EngineConfig, MakerEngine};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeResult, InstrumentPort, MarketDataPort, OrderEventPort,
-    PlaceOrderAck, PositionMode, TradingPort,
+    CancelOutcome, EventStream, ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboPublisher,
+    LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode,
+    TradingPort,
 };
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +32,8 @@ enum Call {
     CancelAll,
 }
 
+type BookPublisher = Arc<Mutex<Option<LatestBboPublisher>>>;
+
 struct MockExchange {
     symbol: Symbol,
     spec: InstrumentSpec,
@@ -39,14 +41,14 @@ struct MockExchange {
     calls: Mutex<Vec<Call>>,
     next_order_id: AtomicU64,
     order_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<OrderUpdate>>>>,
-    book_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<BestBidAsk>>>>,
+    book_publisher: BookPublisher,
 }
 
 impl MockExchange {
     fn new() -> (
         Arc<Self>,
         mpsc::UnboundedSender<ExchangeResult<OrderUpdate>>,
-        mpsc::UnboundedSender<ExchangeResult<BestBidAsk>>,
+        BookPublisher,
     ) {
         let symbol = Symbol::new("BTCUSDT").unwrap();
         let spec = InstrumentSpec::new(
@@ -65,7 +67,7 @@ impl MockExchange {
         )
         .unwrap();
         let (order_sender, order_receiver) = mpsc::unbounded_channel();
-        let (book_sender, book_receiver) = mpsc::unbounded_channel();
+        let book_publisher = Arc::new(Mutex::new(None));
         (
             Arc::new(Self {
                 symbol,
@@ -74,10 +76,10 @@ impl MockExchange {
                 calls: Mutex::new(Vec::new()),
                 next_order_id: AtomicU64::new(1),
                 order_receiver: Mutex::new(Some(order_receiver)),
-                book_receiver: Mutex::new(Some(book_receiver)),
+                book_publisher: book_publisher.clone(),
             }),
             order_sender,
-            book_sender,
+            book_publisher,
         )
     }
 
@@ -113,83 +115,94 @@ impl MockExchange {
     }
 }
 
-#[async_trait]
-impl InstrumentPort for MockExchange {
-    async fn instrument_spec(&self, _symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
-        Ok(self.spec.clone())
-    }
+struct MockSession(Arc<MockExchange>);
 
-    async fn position_mode(&self) -> ExchangeResult<PositionMode> {
-        Ok(PositionMode::OneWay)
-    }
-}
+impl std::ops::Deref for MockSession {
+    type Target = MockExchange;
 
-#[async_trait]
-impl MarketDataPort for MockExchange {
-    async fn best_bid_ask(&self, _symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
-        Ok(self.book)
-    }
-
-    async fn subscribe_best_bid_ask(
-        &self,
-        _symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<BestBidAsk>> {
-        let receiver = self
-            .book_receiver
-            .lock()
-            .unwrap()
-            .take()
-            .expect("book stream subscribed once");
-        Ok(Box::pin(UnboundedReceiverStream::new(receiver)))
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-#[async_trait]
-impl TradingPort for MockExchange {
-    async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
+impl InstrumentPort for MockSession {
+    fn instrument_spec(&mut self, _symbol: Symbol) -> ExchangeFuture<InstrumentSpec> {
+        let spec = self.spec.clone();
+        Box::pin(async move { Ok(spec) })
+    }
+
+    fn position_mode(&mut self) -> ExchangeFuture<PositionMode> {
+        Box::pin(async { Ok(PositionMode::OneWay) })
+    }
+}
+
+impl MarketDataPort for MockSession {
+    fn best_bid_ask(&mut self, _symbol: Symbol) -> ExchangeFuture<BestBidAsk> {
+        let book = self.book;
+        Box::pin(async move { Ok(book) })
+    }
+
+    fn subscribe_best_bid_ask(
+        &mut self,
+        _symbol: Symbol,
+        initial: BestBidAsk,
+    ) -> ExchangeFuture<LatestBboSubscription> {
+        let (publisher, subscription) = LatestBboSubscription::channel(initial);
+        *self.book_publisher.lock().unwrap() = Some(publisher);
+        Box::pin(async move { Ok(subscription) })
+    }
+}
+
+impl TradingPort for MockSession {
+    fn place_post_only(&mut self, intent: OrderIntent) -> ExchangeFuture<PlaceOrderAck> {
         let exchange_order_id =
             ExchangeOrderId::new(self.next_order_id.fetch_add(1, Ordering::Relaxed)).unwrap();
         self.calls.lock().unwrap().push(Call::Place {
             intent,
             exchange_order_id,
         });
-        Ok(PlaceOrderAck::new(
-            self.symbol,
-            *intent.client_order_id(),
-            exchange_order_id,
-        ))
+        let symbol = self.symbol;
+        Box::pin(async move {
+            Ok(PlaceOrderAck::new(
+                symbol,
+                *intent.client_order_id(),
+                exchange_order_id,
+            ))
+        })
     }
 
-    async fn cancel_order(
-        &self,
-        _symbol: &Symbol,
-        client_order_id: &ClientOrderId,
-    ) -> ExchangeResult<CancelOutcome> {
-        self.calls.lock().unwrap().push(Call::Cancel {
-            client_order_id: *client_order_id,
-        });
-        Ok(CancelOutcome::Canceled)
+    fn cancel_order(
+        &mut self,
+        _symbol: Symbol,
+        client_order_id: ClientOrderId,
+    ) -> ExchangeFuture<CancelOutcome> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Cancel { client_order_id });
+        Box::pin(async { Ok(CancelOutcome::Canceled) })
     }
 
-    async fn cancel_all(&self, _symbol: &Symbol) -> ExchangeResult<()> {
+    fn cancel_all(&mut self, _symbol: Symbol) -> ExchangeFuture<()> {
         self.calls.lock().unwrap().push(Call::CancelAll);
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
 }
 
-#[async_trait]
-impl OrderEventPort for MockExchange {
-    async fn subscribe_order_updates(
-        &self,
-        _symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<OrderUpdate>> {
+impl OrderEventPort for MockSession {
+    fn subscribe_order_updates(
+        &mut self,
+        _symbol: Symbol,
+    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
         let receiver = self
             .order_receiver
             .lock()
             .unwrap()
             .take()
             .expect("order stream subscribed once");
-        Ok(Box::pin(UnboundedReceiverStream::new(receiver)))
+        Box::pin(async move {
+            Ok(Box::pin(UnboundedReceiverStream::new(receiver)) as EventStream<OrderUpdate>)
+        })
     }
 }
 
@@ -216,7 +229,10 @@ fn engine_config_with_take_profit(take_profit_ticks: u64) -> EngineConfig {
 async fn same_price_quote_is_reassigned_locally_to_take_profit() {
     let (exchange, order_sender, book_sender) = MockExchange::new();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let mut engine = MakerEngine::new(engine_config_with_take_profit(3), exchange.clone());
+    let mut engine = MakerEngine::new(
+        engine_config_with_take_profit(3),
+        Box::new(MockSession(exchange.clone())),
+    );
     let task = tokio::spawn(async move {
         engine
             .run(async {
@@ -237,12 +253,18 @@ async fn same_price_quote_is_reassigned_locally_to_take_profit() {
         .find(|(intent, _)| intent.side() == Side::Sell && intent.price().get() == 101)
         .unwrap();
     book_sender
-        .send(Ok(BestBidAsk::new(
-            Symbol::new("BTCUSDT").unwrap(),
-            PriceTicks::new(101).unwrap(),
-            PriceTicks::new(102).unwrap(),
+        .lock()
+        .unwrap()
+        .as_mut()
+        .expect("book subscription")
+        .publish(
+            BestBidAsk::new(
+                Symbol::new("BTCUSDT").unwrap(),
+                PriceTicks::new(101).unwrap(),
+                PriceTicks::new(102).unwrap(),
+            )
+            .unwrap(),
         )
-        .unwrap()))
         .unwrap();
     order_sender
         .send(Ok(filled_update(
@@ -316,7 +338,7 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
 async fn boots_full_grid_and_cancels_all_on_shutdown() {
     let (exchange, _order_sender, _book_sender) = MockExchange::new();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let mut engine = MakerEngine::new(engine_config(), exchange.clone());
+    let mut engine = MakerEngine::new(engine_config(), Box::new(MockSession(exchange.clone())));
     let task = tokio::spawn(async move {
         engine
             .run(async {
@@ -353,7 +375,7 @@ async fn boots_full_grid_and_cancels_all_on_shutdown() {
 async fn full_ask_fill_cancels_far_bid_and_places_near_bid_and_far_ask() {
     let (exchange, order_sender, book_sender) = MockExchange::new();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let mut engine = MakerEngine::new(engine_config(), exchange.clone());
+    let mut engine = MakerEngine::new(engine_config(), Box::new(MockSession(exchange.clone())));
     let task = tokio::spawn(async move {
         engine
             .run(async {
@@ -384,12 +406,18 @@ async fn full_ask_fill_cancels_far_bid_and_places_near_bid_and_far_ask() {
         )))
         .unwrap();
     book_sender
-        .send(Ok(BestBidAsk::new(
-            Symbol::new("BTCUSDT").unwrap(),
-            PriceTicks::new(101).unwrap(),
-            PriceTicks::new(102).unwrap(),
+        .lock()
+        .unwrap()
+        .as_mut()
+        .expect("book subscription")
+        .publish(
+            BestBidAsk::new(
+                Symbol::new("BTCUSDT").unwrap(),
+                PriceTicks::new(101).unwrap(),
+                PriceTicks::new(102).unwrap(),
+            )
+            .unwrap(),
         )
-        .unwrap()))
         .unwrap();
     wait_for(|| exchange.placements().len() == 8 && exchange.cancel_count() == 1).await;
 
@@ -420,7 +448,7 @@ async fn full_ask_fill_cancels_far_bid_and_places_near_bid_and_far_ask() {
 async fn partial_fill_does_not_roll_the_grid() {
     let (exchange, order_sender, _book_sender) = MockExchange::new();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let mut engine = MakerEngine::new(engine_config(), exchange.clone());
+    let mut engine = MakerEngine::new(engine_config(), Box::new(MockSession(exchange.clone())));
     let task = tokio::spawn(async move {
         engine
             .run(async {

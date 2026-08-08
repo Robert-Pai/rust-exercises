@@ -2,16 +2,15 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use maker_domain::{BestBidAsk, InstrumentSpec, OrderUpdate, Symbol};
-use maker_ports::{EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use maker_ports::{
+    EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult, LatestBboPublisher,
+    LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{
-    adapter::BinanceUsdm,
     error, mapping,
     models::{BookTickerEventDto, PrivateEventDto},
-    network::NetworkRuntime,
     rest::RestClient,
 };
 
@@ -20,68 +19,64 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const EVENT_BUFFER: usize = 256;
 
 pub(crate) async fn subscribe_book_ticker(
-    network: NetworkRuntime,
     websocket_url: &str,
     symbol: Symbol,
     spec: InstrumentSpec,
     connect_timeout: Duration,
     idle_timeout: Duration,
-) -> ExchangeResult<EventStream<BestBidAsk>> {
+    initial: BestBidAsk,
+) -> ExchangeResult<LatestBboSubscription> {
     let stream_name = format!("{}@bookTicker", symbol.as_str().to_ascii_lowercase());
     let endpoint = stream_endpoint(websocket_url, &stream_name);
-    network
-        .call(async move {
-            let socket = connect(&endpoint, connect_timeout).await?;
-            let (sender, receiver) = mpsc::channel(EVENT_BUFFER);
-            tokio::spawn(run_book_ticker(socket, sender, symbol, spec, idle_timeout));
-            Ok(Box::pin(ReceiverStream::new(receiver)) as EventStream<BestBidAsk>)
-        })
-        .await
+    let (publisher, subscription) = LatestBboSubscription::channel(initial);
+    let socket = connect(&endpoint, connect_timeout).await?;
+    tokio::spawn(run_book_ticker(
+        socket,
+        publisher,
+        symbol,
+        spec,
+        idle_timeout,
+    ));
+    Ok(subscription)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn subscribe_order_updates(
-    network: NetworkRuntime,
-    adapter: BinanceUsdm,
     rest: RestClient,
     target_symbol: Symbol,
+    spec: InstrumentSpec,
     websocket_url: &str,
     connect_timeout: Duration,
     idle_timeout: Duration,
     keepalive_interval: Duration,
 ) -> ExchangeResult<EventStream<OrderUpdate>> {
-    let websocket_url = websocket_url.to_owned();
-    network
-        .call(async move {
-            let listen_key = rest.create_listen_key().await?;
-            let endpoint = stream_endpoint(&websocket_url, &listen_key);
-            let socket = connect(&endpoint, connect_timeout).await?;
-            let (sender, receiver) = mpsc::channel(EVENT_BUFFER);
-            tokio::spawn(run_order_updates(
-                socket,
-                sender,
-                adapter,
-                rest,
-                target_symbol,
-                listen_key,
-                idle_timeout,
-                keepalive_interval,
-            ));
-            Ok(Box::pin(ReceiverStream::new(receiver)) as EventStream<OrderUpdate>)
-        })
-        .await
+    let listen_key = rest.create_listen_key().await?;
+    let endpoint = stream_endpoint(websocket_url, &listen_key);
+    let socket = connect(&endpoint, connect_timeout).await?;
+    let (sender, receiver) = OrderUpdateSubscription::channel(EVENT_BUFFER);
+    tokio::spawn(run_order_updates(
+        socket,
+        sender,
+        spec,
+        rest,
+        target_symbol,
+        listen_key,
+        idle_timeout,
+        keepalive_interval,
+    ));
+    Ok(Box::pin(receiver) as EventStream<OrderUpdate>)
 }
 
 async fn run_book_ticker(
     mut socket: Socket,
-    sender: mpsc::Sender<ExchangeResult<BestBidAsk>>,
+    mut publisher: LatestBboPublisher,
     symbol: Symbol,
     spec: InstrumentSpec,
     idle_timeout: Duration,
 ) {
     let terminal_error = loop {
         let message = tokio::select! {
-            _ = sender.closed() => {
+            _ = publisher.closed() => {
                 let _ = socket.close(None).await;
                 return;
             }
@@ -109,15 +104,8 @@ async fn run_book_ticker(
                     Ok(update) => update,
                     Err(error) => break error,
                 };
-                match sender.try_send(Ok(update)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        break ExchangeError::new(
-                            ExchangeErrorKind::ServiceUnavailable,
-                            "Binance bookTicker event queue is full",
-                        );
-                    }
+                if let Err(error) = publisher.publish(update) {
+                    break error;
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -135,14 +123,14 @@ async fn run_book_ticker(
             Err(error) => break error::websocket(error),
         }
     };
-    let _ = sender.try_send(Err(terminal_error));
+    publisher.fail(terminal_error);
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_order_updates(
     mut socket: Socket,
-    sender: mpsc::Sender<ExchangeResult<OrderUpdate>>,
-    adapter: BinanceUsdm,
+    mut sender: OrderUpdatePublisher,
+    spec: InstrumentSpec,
     rest: RestClient,
     target_symbol: Symbol,
     listen_key: String,
@@ -152,6 +140,8 @@ async fn run_order_updates(
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await;
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
 
     let terminal_error = loop {
         tokio::select! {
@@ -160,6 +150,7 @@ async fn run_order_updates(
                 return;
             }
             message = socket.next() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                 let Some(message) = message else {
                     break ExchangeError::new(
                         ExchangeErrorKind::Network,
@@ -182,24 +173,16 @@ async fn run_order_updates(
                                 if !is_owned_target_limit_order(&target_symbol, &order) {
                                     continue;
                                 }
-                                let spec = match adapter.cached_instrument_spec(&target_symbol) {
-                                    Ok(spec) => spec,
-                                    Err(error) => break error,
-                                };
                                 let update = match mapping::websocket_order(&spec, order) {
                                     Ok(Some(update)) => update,
                                     Ok(None) => continue,
                                     Err(error) => break error,
                                 };
-                                match sender.try_send(Ok(update)) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        break ExchangeError::new(
-                                            ExchangeErrorKind::ServiceUnavailable,
-                                            "Binance user-data event queue is full",
-                                        );
+                                if let Err(error) = sender.publish(update) {
+                                    if sender.is_closed() {
+                                        return;
                                     }
+                                    break error;
                                 }
                             }
                             PrivateEventDto::ListenKeyExpired => {
@@ -231,7 +214,7 @@ async fn run_order_updates(
                     break error;
                 }
             }
-            _ = tokio::time::sleep(idle_timeout) => {
+            _ = &mut idle => {
                 break ExchangeError::new(
                     ExchangeErrorKind::Timeout,
                     "Binance user-data WebSocket became idle",
@@ -239,7 +222,7 @@ async fn run_order_updates(
             }
         }
     };
-    let _ = sender.try_send(Err(terminal_error));
+    sender.fail(terminal_error);
 }
 
 async fn connect(endpoint: &str, timeout: Duration) -> ExchangeResult<Socket> {

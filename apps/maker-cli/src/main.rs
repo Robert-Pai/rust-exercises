@@ -4,7 +4,6 @@ mod strategy_runtime;
 use std::{
     fs,
     path::Path,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,11 +31,9 @@ async fn main() -> Result<()> {
         "starting live maker"
     );
 
-    let exchange = Arc::new(
-        BinanceUsdm::new(exchange_config, credentials)
-            .context("failed to create Binance USD-M adapter")?,
-    );
-    let engine = MakerEngine::new(engine_config, exchange);
+    let exchange = BinanceUsdm::new(exchange_config, credentials)
+        .context("failed to create Binance USD-M adapter")?;
+    let engine = MakerEngine::new(engine_config, Box::new(exchange));
     let strategy = strategy_runtime::spawn(engine, strategy_settings)
         .context("failed to start maker strategy thread")?;
 

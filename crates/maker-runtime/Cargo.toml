@@ -7,12 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 core_affinity = "0.8"
-serde = { version = "1", features = ["derive"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+rtrb = "=0.3.4"
 thiserror.workspace = true
-tracing = "0.1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"] }

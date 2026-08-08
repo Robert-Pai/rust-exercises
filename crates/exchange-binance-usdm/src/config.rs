@@ -2,7 +2,6 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey};
 use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeResult};
-use maker_runtime::ExecutionMode;
 use secrecy::{ExposeSecret, SecretString};
 
 const DEFAULT_REST_URL: &str = "https://fapi.binance.com";
@@ -78,9 +77,7 @@ pub struct BinanceUsdmConfig {
     request_timeout: Duration,
     listen_key_keepalive: Duration,
     websocket_idle_timeout: Duration,
-    market_data_mode: ExecutionMode,
     market_data_cpu_core: Option<usize>,
-    trading_mode: ExecutionMode,
     trading_cpu_core: Option<usize>,
 }
 
@@ -94,9 +91,7 @@ impl Default for BinanceUsdmConfig {
             request_timeout: Duration::from_secs(5),
             listen_key_keepalive: Duration::from_secs(30 * 60),
             websocket_idle_timeout: Duration::from_secs(4 * 60),
-            market_data_mode: ExecutionMode::EventDriven,
             market_data_cpu_core: None,
-            trading_mode: ExecutionMode::EventDriven,
             trading_cpu_core: None,
         }
     }
@@ -120,9 +115,7 @@ impl BinanceUsdmConfig {
             request_timeout,
             listen_key_keepalive,
             websocket_idle_timeout,
-            market_data_mode: ExecutionMode::EventDriven,
             market_data_cpu_core: None,
-            trading_mode: ExecutionMode::EventDriven,
             trading_cpu_core: None,
         };
         config.validate()?;
@@ -157,47 +150,22 @@ impl BinanceUsdmConfig {
         self.websocket_idle_timeout
     }
 
-    pub const fn market_data_mode(&self) -> ExecutionMode {
-        self.market_data_mode
-    }
-
     pub const fn market_data_cpu_core(&self) -> Option<usize> {
         self.market_data_cpu_core
-    }
-
-    pub const fn trading_mode(&self) -> ExecutionMode {
-        self.trading_mode
     }
 
     pub const fn trading_cpu_core(&self) -> Option<usize> {
         self.trading_cpu_core
     }
 
-    pub fn with_market_data_runtime(
+    pub fn with_network_cpu_cores(
         mut self,
-        mode: ExecutionMode,
-        cpu_core: Option<usize>,
-    ) -> Self {
-        self.market_data_mode = mode;
-        self.market_data_cpu_core = cpu_core;
-        self
-    }
-
-    pub fn with_trading_runtime(mut self, mode: ExecutionMode, cpu_core: Option<usize>) -> Self {
-        self.trading_mode = mode;
-        self.trading_cpu_core = cpu_core;
-        self
-    }
-
-    pub fn with_network_runtimes(
-        self,
-        market_data_mode: ExecutionMode,
         market_data_cpu_core: Option<usize>,
-        trading_mode: ExecutionMode,
         trading_cpu_core: Option<usize>,
     ) -> Self {
-        self.with_market_data_runtime(market_data_mode, market_data_cpu_core)
-            .with_trading_runtime(trading_mode, trading_cpu_core)
+        self.market_data_cpu_core = market_data_cpu_core;
+        self.trading_cpu_core = trading_cpu_core;
+        self
     }
 
     pub(crate) fn validate(&self) -> ExchangeResult<()> {
@@ -325,17 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn configures_network_runtimes_independently() {
-        let config = BinanceUsdmConfig::default().with_network_runtimes(
-            ExecutionMode::EventDriven,
-            Some(3),
-            ExecutionMode::BusySpin,
-            Some(2),
-        );
+    fn configures_network_cpu_cores_independently() {
+        let config = BinanceUsdmConfig::default().with_network_cpu_cores(Some(3), Some(2));
 
-        assert_eq!(config.market_data_mode(), ExecutionMode::EventDriven);
         assert_eq!(config.market_data_cpu_core(), Some(3));
-        assert_eq!(config.trading_mode(), ExecutionMode::BusySpin);
         assert_eq!(config.trading_cpu_core(), Some(2));
     }
 

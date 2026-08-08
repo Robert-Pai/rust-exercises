@@ -4,15 +4,15 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use maker_domain::{
     BestBidAsk, ClientOrderId, ExchangeOrderId, FilledLots, InstrumentSpec, MarketKind,
     OrderIntent, OrderStatus, OrderUpdate, PriceTicks, Side, Symbol,
 };
 use maker_engine::{EngineConfig, MakerEngine};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult, InstrumentPort,
-    MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode, TradingPort,
+    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
+    InstrumentPort, LatestBboPublisher, LatestBboSubscription, MarketDataPort, OrderEventPort,
+    PlaceOrderAck, PositionMode, TradingPort,
 };
 use rust_decimal::Decimal;
 use tokio::{
@@ -48,7 +48,7 @@ struct MockState {
     next_exchange_order_id: u64,
     place_failures: VecDeque<ExchangeError>,
     order_senders: Vec<mpsc::UnboundedSender<ExchangeResult<OrderUpdate>>>,
-    book_senders: Vec<mpsc::UnboundedSender<ExchangeResult<BestBidAsk>>>,
+    book_publishers: Vec<LatestBboPublisher>,
 }
 
 struct MockExchange {
@@ -237,10 +237,10 @@ impl MockExchange {
         self.state
             .lock()
             .unwrap()
-            .book_senders
-            .last()
+            .book_publishers
+            .last_mut()
             .expect("book subscription")
-            .send(Ok(book))
+            .publish(book)
             .expect("live book subscription");
     }
 
@@ -257,76 +257,102 @@ impl MockExchange {
             )))
             .expect("live order subscription");
     }
+
+    fn fail_book_stream(&self) {
+        let publisher = self
+            .state
+            .lock()
+            .unwrap()
+            .book_publishers
+            .pop()
+            .expect("book subscription");
+        publisher.fail(ExchangeError::new(
+            ExchangeErrorKind::Network,
+            "injected book stream failure",
+        ));
+    }
 }
 
-#[async_trait]
-impl InstrumentPort for MockExchange {
-    async fn instrument_spec(&self, _symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
+struct MockSession(Arc<MockExchange>);
+
+impl std::ops::Deref for MockSession {
+    type Target = MockExchange;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl InstrumentPort for MockSession {
+    fn instrument_spec(&mut self, _symbol: Symbol) -> ExchangeFuture<InstrumentSpec> {
         self.record(Action::Instrument);
-        Ok(self.instrument.lock().unwrap().clone())
+        let spec = self.instrument.lock().unwrap().clone();
+        Box::pin(async move { Ok(spec) })
     }
 
-    async fn refresh_instrument_spec(&self, _symbol: &Symbol) -> ExchangeResult<InstrumentSpec> {
+    fn refresh_instrument_spec(&mut self, _symbol: Symbol) -> ExchangeFuture<InstrumentSpec> {
         self.record(Action::RefreshInstrument);
-        Ok(self
+        let spec = self
             .next_refreshed_instrument
             .lock()
             .unwrap()
             .take()
-            .unwrap_or_else(|| self.instrument.lock().unwrap().clone()))
+            .unwrap_or_else(|| self.instrument.lock().unwrap().clone());
+        Box::pin(async move { Ok(spec) })
     }
 
-    fn apply_instrument_spec(&self, instrument: InstrumentSpec) -> ExchangeResult<()> {
+    fn apply_instrument_spec(&mut self, instrument: InstrumentSpec) -> ExchangeResult<()> {
         *self.instrument.lock().unwrap() = instrument;
         Ok(())
     }
 
-    async fn position_mode(&self) -> ExchangeResult<PositionMode> {
+    fn position_mode(&mut self) -> ExchangeFuture<PositionMode> {
         self.record(Action::PositionMode);
-        Ok(PositionMode::OneWay)
+        Box::pin(async { Ok(PositionMode::OneWay) })
     }
 }
 
-#[async_trait]
-impl MarketDataPort for MockExchange {
-    async fn best_bid_ask(&self, symbol: &Symbol) -> ExchangeResult<BestBidAsk> {
+impl MarketDataPort for MockSession {
+    fn best_bid_ask(&mut self, symbol: Symbol) -> ExchangeFuture<BestBidAsk> {
         self.record(Action::BestBook);
-        Ok(BestBidAsk::new(
-            *symbol,
-            PriceTicks::new(99).unwrap(),
-            PriceTicks::new(101).unwrap(),
-        )
-        .unwrap())
+        Box::pin(async move {
+            Ok(BestBidAsk::new(
+                symbol,
+                PriceTicks::new(99).unwrap(),
+                PriceTicks::new(101).unwrap(),
+            )
+            .unwrap())
+        })
     }
 
-    async fn subscribe_best_bid_ask(
-        &self,
-        _symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<BestBidAsk>> {
+    fn subscribe_best_bid_ask(
+        &mut self,
+        _symbol: Symbol,
+        initial: BestBidAsk,
+    ) -> ExchangeFuture<LatestBboSubscription> {
         self.record(Action::SubscribeBook);
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.state.lock().unwrap().book_senders.push(sender);
-        Ok(Box::pin(UnboundedReceiverStream::new(receiver)))
+        let (publisher, subscription) = LatestBboSubscription::channel(initial);
+        self.state.lock().unwrap().book_publishers.push(publisher);
+        Box::pin(async move { Ok(subscription) })
     }
 }
 
-#[async_trait]
-impl TradingPort for MockExchange {
-    async fn place_post_only(&self, intent: OrderIntent) -> ExchangeResult<PlaceOrderAck> {
+impl TradingPort for MockSession {
+    fn place_post_only(&mut self, intent: OrderIntent) -> ExchangeFuture<PlaceOrderAck> {
         self.record(Action::Place);
-        let exchange_order_id = {
+        let result = {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.place_failures.pop_front() {
-                return Err(error);
+                Err(error)
+            } else {
+                let exchange_order_id = ExchangeOrderId::new(state.next_exchange_order_id).unwrap();
+                state.next_exchange_order_id += 1;
+                state.accepted.push(AcceptedOrder {
+                    intent,
+                    exchange_order_id,
+                });
+                Ok(exchange_order_id)
             }
-
-            let exchange_order_id = ExchangeOrderId::new(state.next_exchange_order_id).unwrap();
-            state.next_exchange_order_id += 1;
-            state.accepted.push(AcceptedOrder {
-                intent,
-                exchange_order_id,
-            });
-            exchange_order_id
         };
         self.changed.notify_waiters();
         let gate = self
@@ -336,50 +362,56 @@ impl TradingPort for MockExchange {
             .as_ref()
             .filter(|(side, price, _)| *side == intent.side() && *price == intent.price().get())
             .map(|(_, _, gate)| gate.clone());
-        if let Some(gate) = gate {
-            gate.acquire().await.unwrap().forget();
-        }
-        Ok(PlaceOrderAck::new(
-            *intent.symbol(),
-            *intent.client_order_id(),
-            exchange_order_id,
-        ))
+        Box::pin(async move {
+            let exchange_order_id = result?;
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            Ok(PlaceOrderAck::new(
+                *intent.symbol(),
+                *intent.client_order_id(),
+                exchange_order_id,
+            ))
+        })
     }
 
-    async fn cancel_order(
-        &self,
-        _symbol: &Symbol,
-        client_order_id: &ClientOrderId,
-    ) -> ExchangeResult<CancelOutcome> {
-        self.record(Action::Cancel(*client_order_id));
+    fn cancel_order(
+        &mut self,
+        _symbol: Symbol,
+        client_order_id: ClientOrderId,
+    ) -> ExchangeFuture<CancelOutcome> {
+        self.record(Action::Cancel(client_order_id));
         let gate = self
             .blocked_cancels
             .lock()
             .unwrap()
-            .get(client_order_id)
+            .get(&client_order_id)
             .cloned();
-        if let Some(gate) = gate {
-            gate.acquire().await.unwrap().forget();
-        }
-        Ok(CancelOutcome::Canceled)
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            Ok(CancelOutcome::Canceled)
+        })
     }
 
-    async fn cancel_all(&self, _symbol: &Symbol) -> ExchangeResult<()> {
+    fn cancel_all(&mut self, _symbol: Symbol) -> ExchangeFuture<()> {
         self.record(Action::CancelAll);
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
 }
 
-#[async_trait]
-impl OrderEventPort for MockExchange {
-    async fn subscribe_order_updates(
-        &self,
-        _symbol: &Symbol,
-    ) -> ExchangeResult<EventStream<OrderUpdate>> {
+impl OrderEventPort for MockSession {
+    fn subscribe_order_updates(
+        &mut self,
+        _symbol: Symbol,
+    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
         self.record(Action::SubscribeOrders);
         let (sender, receiver) = mpsc::unbounded_channel();
         self.state.lock().unwrap().order_senders.push(sender);
-        Ok(Box::pin(UnboundedReceiverStream::new(receiver)))
+        Box::pin(async move {
+            Ok(Box::pin(UnboundedReceiverStream::new(receiver)) as EventStream<OrderUpdate>)
+        })
     }
 }
 
@@ -419,7 +451,7 @@ fn start_engine_with_config(
     JoinHandle<Result<(), maker_engine::EngineError>>,
 ) {
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let exchange_port: Arc<dyn maker_ports::Exchange> = exchange;
+    let exchange_port: Box<dyn maker_ports::Exchange> = Box::new(MockSession(exchange));
     let mut engine = MakerEngine::new(config, exchange_port);
     let task = tokio::spawn(async move {
         engine
@@ -449,9 +481,9 @@ async fn bootstraps_streams_before_cancel_and_places_both_sides() {
     assert!(matches!(actions[0], Action::Instrument));
     assert!(matches!(actions[1], Action::PositionMode));
     assert!(matches!(actions[2], Action::SubscribeOrders));
-    assert!(matches!(actions[3], Action::SubscribeBook));
-    assert!(matches!(actions[4], Action::CancelAll));
-    assert!(matches!(actions[5], Action::BestBook));
+    assert!(matches!(actions[3], Action::BestBook));
+    assert!(matches!(actions[4], Action::SubscribeBook));
+    assert!(matches!(actions[5], Action::CancelAll));
 
     let mut prices: Vec<_> = exchange
         .accepted_orders()
@@ -654,6 +686,28 @@ async fn bid_fill_rolls_symmetrically() {
 }
 
 #[tokio::test]
+async fn latest_book_overwrites_pending_updates_before_fill_reconcile() {
+    let exchange = MockExchange::new();
+    let (shutdown, task) = start_engine(exchange.clone());
+    exchange.wait_for_accepted(6).await;
+
+    exchange.send_book(101, 102);
+    exchange.send_book(99, 100);
+    exchange.send_order_update(exchange.update_for(Side::Sell, 101, OrderStatus::Filled, 2));
+    exchange.wait_for_order(Side::Sell, 104).await;
+    sleep(Duration::from_millis(60)).await;
+
+    assert!(
+        !exchange
+            .accepted_orders()
+            .iter()
+            .any(|order| order.intent.side() == Side::Buy && order.intent.price().get() == 100)
+    );
+
+    stop_engine(shutdown, task).await;
+}
+
+#[tokio::test]
 async fn partial_fill_does_not_roll_the_grid() {
     let exchange = MockExchange::new();
     let (shutdown, task) = start_engine(exchange.clone());
@@ -738,6 +792,34 @@ async fn defers_out_of_order_fills_until_grid_can_advance() {
     exchange.wait_for_order(Side::Sell, 104).await;
     exchange.wait_for_order(Side::Sell, 105).await;
 
+    stop_engine(shutdown, task).await;
+}
+
+#[tokio::test]
+async fn book_stream_failure_recreates_both_subscriptions() {
+    let exchange = MockExchange::new();
+    let (shutdown, task) = start_engine(exchange.clone());
+    exchange.wait_for_accepted(6).await;
+
+    exchange.fail_book_stream();
+    exchange
+        .wait_for(|state| {
+            state
+                .actions
+                .iter()
+                .filter(|action| matches!(action, Action::SubscribeBook))
+                .count()
+                >= 2
+                && state
+                    .actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::SubscribeOrders))
+                    .count()
+                    >= 2
+        })
+        .await;
+
+    assert!(exchange.action_count(|action| matches!(action, Action::CancelAll)) >= 3);
     stop_engine(shutdown, task).await;
 }
 

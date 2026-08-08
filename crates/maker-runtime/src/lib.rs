@@ -1,19 +1,14 @@
+mod spsc;
+
+pub use spsc::{SpscConsumer, SpscProducer, TryPushError, spsc_channel};
+
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use serde::Deserialize;
 use thiserror::Error;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    #[default]
-    EventDriven,
-    BusySpin,
-}
 
 #[derive(Debug, Error)]
 pub enum CpuAffinityError {
@@ -39,38 +34,16 @@ pub fn bind_cpu(core_index: Option<usize>) -> Result<(), CpuAffinityError> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Err(error) = bind_macos_affinity_tag(core_index) {
-            tracing::warn!(%error, core = core_index, "macOS affinity hint unavailable");
-        }
+        let _ = cores;
+        Err(CpuAffinityError::Unavailable)
     }
     #[cfg(not(target_os = "macos"))]
     {
         if !core_affinity::set_for_current(cores[core_index]) {
             return Err(CpuAffinityError::SetFailed(core_index));
         }
+        Ok(())
     }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn bind_macos_affinity_tag(core_index: usize) -> Result<(), CpuAffinityError> {
-    let tag = i32::try_from(core_index + 1).map_err(|_| CpuAffinityError::SetFailed(core_index))?;
-    let mut policy = libc::thread_affinity_policy { affinity_tag: tag };
-    // `pthread_self` returns an opaque pthread pointer on Darwin. Mach's
-    // thread_policy_set requires the corresponding Mach thread port.
-    let thread = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
-    let result = unsafe {
-        libc::thread_policy_set(
-            thread,
-            libc::THREAD_AFFINITY_POLICY as libc::thread_policy_flavor_t,
-            (&mut policy as *mut libc::thread_affinity_policy).cast(),
-            libc::THREAD_AFFINITY_POLICY_COUNT,
-        )
-    };
-    if result != 0 {
-        return Err(CpuAffinityError::SetFailed(core_index));
-    }
-    Ok(())
 }
 
 /// Keeps a current-thread runtime active by immediately scheduling another poll
@@ -138,7 +111,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_affinity_tag_uses_a_valid_mach_thread_port() {
-        assert!(bind_cpu(Some(0)).is_ok());
+    fn macos_reports_affinity_as_unavailable() {
+        assert!(matches!(
+            bind_cpu(Some(0)),
+            Err(CpuAffinityError::Unavailable)
+        ));
     }
 }

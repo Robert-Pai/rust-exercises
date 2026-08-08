@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,7 +8,6 @@ use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeResult};
 use reqwest::{Method, RequestBuilder};
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
 
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
@@ -35,9 +31,6 @@ struct RestInner {
     base_url: String,
     credentials: BinanceCredentials,
     recv_window_ms: u64,
-    clock_offset_ms: AtomicI64,
-    clock_synchronized: AtomicBool,
-    clock_sync_lock: Mutex<()>,
 }
 
 impl RestClient {
@@ -63,9 +56,6 @@ impl RestClient {
                 base_url: config.rest_url().trim_end_matches('/').to_owned(),
                 credentials,
                 recv_window_ms,
-                clock_offset_ms: AtomicI64::new(0),
-                clock_synchronized: AtomicBool::new(false),
-                clock_sync_lock: Mutex::new(()),
             }),
         })
     }
@@ -177,9 +167,9 @@ impl RestClient {
     where
         T: DeserializeOwned,
     {
-        self.synchronize_clock(false).await?;
+        let mut clock_offset_ms = self.clock_offset_ms().await?;
         for attempt in 0..2 {
-            let timestamp = self.signed_timestamp_ms()?;
+            let timestamp = signed_timestamp_ms(clock_offset_ms)?;
             let query = build_signed_query(
                 parameters.clone(),
                 self.inner.recv_window_ms,
@@ -196,7 +186,7 @@ impl RestClient {
                 );
             match self.execute_json(request).await {
                 Err(error) if attempt == 0 && error.exchange_code() == Some("-1021") => {
-                    self.synchronize_clock(true).await?;
+                    clock_offset_ms = self.clock_offset_ms().await?;
                 }
                 result => return result,
             }
@@ -204,15 +194,7 @@ impl RestClient {
         unreachable!("signed request loop always returns on its second attempt")
     }
 
-    pub(crate) async fn synchronize_clock(&self, force: bool) -> ExchangeResult<()> {
-        if !force && self.inner.clock_synchronized.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _guard = self.inner.clock_sync_lock.lock().await;
-        if !force && self.inner.clock_synchronized.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
+    pub(crate) async fn clock_offset_ms(&self) -> ExchangeResult<i64> {
         let before = unix_time_ms()?;
         let server: ServerTimeDto = self
             .public_json(Method::GET, "/fapi/v1/time", Vec::new())
@@ -231,36 +213,10 @@ impl RestClient {
                 "local system time exceeds supported range",
             )
         })?;
-        let offset = server.checked_sub(local).ok_or_else(|| {
+        server.checked_sub(local).ok_or_else(|| {
             ExchangeError::new(
                 ExchangeErrorKind::StateConflict,
                 "clock offset exceeds supported range",
-            )
-        })?;
-        self.inner.clock_offset_ms.store(offset, Ordering::Release);
-        self.inner.clock_synchronized.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) fn signed_timestamp_ms(&self) -> ExchangeResult<u64> {
-        let now = i64::try_from(unix_time_ms()?).map_err(|_| {
-            ExchangeError::new(
-                ExchangeErrorKind::StateConflict,
-                "local system time exceeds supported range",
-            )
-        })?;
-        let adjusted = now
-            .checked_add(self.inner.clock_offset_ms.load(Ordering::Acquire))
-            .ok_or_else(|| {
-                ExchangeError::new(
-                    ExchangeErrorKind::StateConflict,
-                    "adjusted Binance timestamp overflowed",
-                )
-            })?;
-        u64::try_from(adjusted).map_err(|_| {
-            ExchangeError::new(
-                ExchangeErrorKind::StateConflict,
-                "adjusted Binance timestamp is before the Unix epoch",
             )
         })
     }
@@ -301,6 +257,27 @@ impl RestClient {
         })?;
         Err(error::api(status, api_error, retry_after))
     }
+}
+
+fn signed_timestamp_ms(clock_offset_ms: i64) -> ExchangeResult<u64> {
+    let now = i64::try_from(unix_time_ms()?).map_err(|_| {
+        ExchangeError::new(
+            ExchangeErrorKind::StateConflict,
+            "local system time exceeds supported range",
+        )
+    })?;
+    let adjusted = now.checked_add(clock_offset_ms).ok_or_else(|| {
+        ExchangeError::new(
+            ExchangeErrorKind::StateConflict,
+            "adjusted Binance timestamp overflowed",
+        )
+    })?;
+    u64::try_from(adjusted).map_err(|_| {
+        ExchangeError::new(
+            ExchangeErrorKind::StateConflict,
+            "adjusted Binance timestamp is before the Unix epoch",
+        )
+    })
 }
 
 fn unix_time_ms() -> ExchangeResult<u64> {

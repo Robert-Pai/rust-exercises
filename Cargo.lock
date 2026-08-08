@@ -20,30 +20,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arc-swap"
-version = "1.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "async-trait"
-version = "0.1.91"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
-]
 
 [[package]]
 name = "atomic-waker"
@@ -380,8 +360,6 @@ dependencies = [
 name = "exchange-binance-usdm"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
- "async-trait",
  "base64",
  "ed25519-dalek",
  "futures-util",
@@ -395,9 +373,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-stream",
  "tokio-tungstenite",
- "tracing",
  "url",
 ]
 
@@ -864,7 +840,6 @@ dependencies = [
 name = "maker-engine"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "futures-util",
  "maker-domain",
  "maker-ports",
@@ -872,18 +847,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
- "tracing",
 ]
 
 [[package]]
 name = "maker-ports"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "futures-core",
+ "futures-util",
  "maker-domain",
+ "maker-runtime",
  "rust_decimal",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -891,11 +867,11 @@ name = "maker-runtime"
 version = "0.1.0"
 dependencies = [
  "core_affinity",
- "libc",
- "serde",
+ "futures-core",
+ "futures-util",
+ "rtrb",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1345,6 +1321,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
 name = "rust_decimal"

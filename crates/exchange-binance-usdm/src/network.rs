@@ -2,19 +2,31 @@
 //!
 //! Public market data and latency-critical trading traffic are scheduled on
 //! separate current-thread Tokio runtimes so bursts on one cannot delay the
-//! other. Each runtime has independently configurable parking behavior and CPU
-//! affinity.
+//! other. Each runtime has independently configurable CPU affinity.
 
-use std::{future::Future, sync::mpsc as std_mpsc, thread};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use futures_util::future::BoxFuture;
-use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeResult};
-use maker_runtime::{BusyPoll, ExecutionMode, bind_cpu};
-use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult};
+use maker_runtime::{BusyPoll, SpscConsumer, SpscProducer, TryPushError, bind_cpu, spsc_channel};
+use tokio::sync::oneshot;
+
+use crate::config::BinanceUsdmConfig;
 
 type NetworkTask = BoxFuture<'static, ()>;
 const TASK_BUFFER: usize = 64;
+const STARTING: u8 = 0;
+const READY: u8 = 1;
+const AFFINITY_FAILED: u8 = 2;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NetworkRole {
@@ -38,20 +50,14 @@ impl NetworkRole {
     }
 }
 
-/// Handle used by non-network tasks to schedule work on a dedicated network
-/// thread.
-#[derive(Clone)]
+/// Move-only strategy-side producer for one dedicated network thread.
 pub(crate) struct NetworkRuntime {
     role: NetworkRole,
-    tasks: mpsc::Sender<NetworkTask>,
+    tasks: SpscProducer<NetworkTask>,
 }
 
 impl NetworkRuntime {
-    pub(crate) fn new(
-        role: NetworkRole,
-        mode: ExecutionMode,
-        cpu_core: Option<usize>,
-    ) -> ExchangeResult<Self> {
+    pub(crate) fn new(role: NetworkRole, config: &BinanceUsdmConfig) -> ExchangeResult<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -64,29 +70,23 @@ impl NetworkRuntime {
                     ),
                 )
             })?;
-        let (tasks, receiver) = mpsc::channel(TASK_BUFFER);
-        let (startup, started) = std_mpsc::sync_channel(1);
+        let (tasks, receiver) = spsc_channel(TASK_BUFFER);
+        let cpu_core = match role {
+            NetworkRole::MarketData => config.market_data_cpu_core(),
+            NetworkRole::Trading => config.trading_cpu_core(),
+        };
 
+        let startup = Arc::new(AtomicU8::new(STARTING));
+        let worker_startup = startup.clone();
         thread::Builder::new()
             .name(role.thread_name().to_owned())
             .spawn(move || {
-                if let Err(error) = bind_cpu(cpu_core) {
-                    let _ = startup.send(Err(error));
+                if bind_cpu(cpu_core).is_err() {
+                    worker_startup.store(AFFINITY_FAILED, Ordering::Release);
                     return;
                 }
-                let _ = startup.send(Ok(()));
-                info!(
-                    network_role = role.label(),
-                    ?mode,
-                    ?cpu_core,
-                    "Binance network runtime started"
-                );
-                match mode {
-                    ExecutionMode::EventDriven => runtime.block_on(run_network_loop(receiver)),
-                    ExecutionMode::BusySpin => {
-                        runtime.block_on(BusyPoll::new(run_network_loop(receiver)))
-                    }
-                }
+                worker_startup.store(READY, Ordering::Release);
+                runtime.block_on(BusyPoll::new(run_network_loop(receiver)));
             })
             .map_err(|error| {
                 ExchangeError::new(
@@ -97,59 +97,66 @@ impl NetworkRuntime {
                     ),
                 )
             })?;
-        started
-            .recv()
-            .map_err(|_| self_stopped(role, "network thread stopped during startup"))?
-            .map_err(|error| {
-                ExchangeError::new(
-                    ExchangeErrorKind::InvalidRequest,
-                    format!(
-                        "failed to bind Binance {} network thread: {error}",
-                        role.label()
-                    ),
-                )
-            })?;
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            match startup.load(Ordering::Acquire) {
+                READY => break,
+                AFFINITY_FAILED => {
+                    return Err(ExchangeError::new(
+                        ExchangeErrorKind::InvalidRequest,
+                        format!("failed to bind Binance {} network thread", role.label()),
+                    ));
+                }
+                STARTING if Instant::now() < deadline => std::hint::spin_loop(),
+                STARTING => {
+                    return Err(self_stopped(role, "network thread startup timed out"));
+                }
+                _ => unreachable!("network startup state is valid"),
+            }
+        }
 
         Ok(Self { role, tasks })
     }
 
-    /// Schedules a long-lived network task. The task is spawned by the
-    /// current-thread runtime, so its socket polling remains on the selected
-    /// network thread even when the caller is the strategy runtime.
-    pub(crate) fn spawn<F>(&self, task: F) -> ExchangeResult<()>
+    /// Schedules a long-lived task without waiting or cloning the producer.
+    pub(crate) fn spawn<F>(&mut self, task: F) -> ExchangeResult<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         self.tasks
-            .try_send(Box::pin(task))
+            .try_push(Box::pin(task))
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
+                TryPushError::Full(_) => {
                     self_stopped(self.role, "network runtime task queue is full")
                 }
-                mpsc::error::TrySendError::Closed(_) => {
+                TryPushError::ConsumerDropped(_) => {
                     self_stopped(self.role, "network runtime stopped")
                 }
             })
     }
 
-    /// Runs a short network operation on the selected network thread and
-    /// returns its result to the caller's runtime.
-    pub(crate) async fn call<F, T>(&self, operation: F) -> ExchangeResult<T>
+    /// Dispatches a short operation and returns an owned response future.
+    pub(crate) fn call<F, T>(&mut self, operation: F) -> ExchangeFuture<T>
     where
         F: Future<Output = ExchangeResult<T>> + Send + 'static,
         T: Send + 'static,
     {
         let (reply, response) = oneshot::channel();
-        self.spawn(async move {
+        if let Err(error) = self.spawn(async move {
             let _ = reply.send(operation.await);
-        })?;
-        response
-            .await
-            .map_err(|_| self_stopped(self.role, "network operation response channel closed"))?
+        }) {
+            return Box::pin(async move { Err(error) });
+        }
+        let role = self.role;
+        Box::pin(async move {
+            response
+                .await
+                .map_err(|_| self_stopped(role, "network operation response channel closed"))?
+        })
     }
 }
 
-async fn run_network_loop(mut tasks: mpsc::Receiver<NetworkTask>) {
+async fn run_network_loop(mut tasks: SpscConsumer<NetworkTask>) {
     while let Some(task) = tasks.recv().await {
         tokio::spawn(task);
     }
@@ -168,7 +175,7 @@ mod tests {
 
     use super::*;
 
-    async fn runtime_identity(runtime: &NetworkRuntime) -> (ThreadId, String) {
+    async fn runtime_identity(runtime: &mut NetworkRuntime) -> (ThreadId, String) {
         runtime
             .call(async move {
                 Ok((
@@ -182,13 +189,13 @@ mod tests {
 
     #[tokio::test]
     async fn roles_run_on_distinct_named_threads() {
-        let market =
-            NetworkRuntime::new(NetworkRole::MarketData, ExecutionMode::EventDriven, None).unwrap();
-        let trading =
-            NetworkRuntime::new(NetworkRole::Trading, ExecutionMode::EventDriven, None).unwrap();
+        let mut market =
+            NetworkRuntime::new(NetworkRole::MarketData, &BinanceUsdmConfig::default()).unwrap();
+        let mut trading =
+            NetworkRuntime::new(NetworkRole::Trading, &BinanceUsdmConfig::default()).unwrap();
 
-        let (market_id, market_name) = runtime_identity(&market).await;
-        let (trading_id, trading_name) = runtime_identity(&trading).await;
+        let (market_id, market_name) = runtime_identity(&mut market).await;
+        let (trading_id, trading_name) = runtime_identity(&mut trading).await;
 
         assert_ne!(market_id, trading_id);
         assert_eq!(market_name, "maker-network-market-data");
@@ -197,8 +204,8 @@ mod tests {
 
     #[tokio::test]
     async fn busy_spin_runtime_drives_network_operations() {
-        let runtime =
-            NetworkRuntime::new(NetworkRole::Trading, ExecutionMode::BusySpin, None).unwrap();
+        let mut runtime =
+            NetworkRuntime::new(NetworkRole::Trading, &BinanceUsdmConfig::default()).unwrap();
 
         assert_eq!(runtime.call(async { Ok(7_u8) }).await.unwrap(), 7);
     }

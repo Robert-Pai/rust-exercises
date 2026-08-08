@@ -2,10 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,10 +12,10 @@ use maker_domain::{
     GridReassignment, InstrumentSpec, OrderIntent, OrderStatus, OrderUpdate, Side,
 };
 use maker_ports::{
-    CancelOutcome, EventStream, Exchange, ExchangeErrorKind, PlaceOrderAck, PositionMode,
+    CancelOutcome, EventStream, Exchange, ExchangeErrorKind, LatestBbo, LatestBboSubscription,
+    PlaceOrderAck, PositionMode,
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
-use tracing::{debug, info, warn};
 
 use crate::{EngineConfig, EngineError, OrderRegistry};
 
@@ -39,11 +36,11 @@ pub enum EnginePhase {
 /// Single-owner coordinator for a desired rolling grid and its exchange orders.
 pub struct MakerEngine {
     config: EngineConfig,
-    exchange: Arc<dyn Exchange>,
+    exchange: Box<dyn Exchange>,
     phase: EnginePhase,
     instrument: Option<InstrumentSpec>,
     grid: Option<GridModel>,
-    latest_book: Option<BestBidAsk>,
+    latest_book: Option<LatestBbo>,
     registry: OrderRegistry,
     placement_attempts: HashMap<ClientOrderId, GridLevel>,
     inflight_placements: HashSet<ClientOrderId>,
@@ -63,7 +60,7 @@ pub struct MakerEngine {
 }
 
 impl MakerEngine {
-    pub fn new(config: EngineConfig, exchange: Arc<dyn Exchange>) -> Self {
+    pub fn new(config: EngineConfig, exchange: Box<dyn Exchange>) -> Self {
         let clock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos() as u64);
@@ -121,6 +118,9 @@ impl MakerEngine {
     where
         F: Future<Output = ()> + Send,
     {
+        self.exchange
+            .start()
+            .map_err(|error| EngineError::exchange("start exchange session", error))?;
         let mut shutdown = Box::pin(shutdown);
         let mut first_attempt = true;
         let mut rebuild_grid = true;
@@ -141,30 +141,18 @@ impl MakerEngine {
                 Ok(mut subscriptions) => {
                     first_attempt = false;
                     self.phase = EnginePhase::Running;
-                    info!(symbol = %self.config.symbol(), "maker grid is running");
 
                     match self.drive(&mut subscriptions, &mut shutdown).await {
                         DriveExit::Shutdown => return self.stop().await,
-                        DriveExit::Recover(reason) => {
-                            warn!(symbol = %self.config.symbol(), %reason, "recovering maker grid");
+                        DriveExit::Recover => {
                             self.phase = EnginePhase::Recovering;
                             if let Err(error) = self.recover_stream_loss().await {
-                                warn!(
-                                    symbol = %self.config.symbol(),
-                                    %error,
-                                    "could not resolve orders during stream recovery; attempting a final cancel-all"
-                                );
                                 let _ = self.cancel_all_for_recovery().await;
                                 return Err(error);
                             }
                             rebuild_grid = false;
                         }
-                        DriveExit::Rebuild(error) => {
-                            warn!(
-                                symbol = %self.config.symbol(),
-                                error = %error,
-                                "rebuilding maker grid"
-                            );
+                        DriveExit::Rebuild => {
                             self.phase = EnginePhase::Stopping;
                             self.cancel_all_for_recovery().await?;
                             rebuild_grid = true;
@@ -178,11 +166,6 @@ impl MakerEngine {
                 }
                 Err(error) if error.recommends_recovery() => {
                     first_attempt = false;
-                    warn!(
-                        symbol = %self.config.symbol(),
-                        error = %error,
-                        "maker bootstrap failed; retrying"
-                    );
                     self.phase = EnginePhase::Recovering;
                     if matches!(error, EngineError::InstrumentRulesChanged { .. }) {
                         rebuild_grid = true;
@@ -196,11 +179,6 @@ impl MakerEngine {
                         // stream failure; cancel-all alone would leave the
                         // local registry claiming canceled orders are live.
                         if let Err(recovery_error) = self.recover_stream_loss().await {
-                            warn!(
-                                symbol = %self.config.symbol(),
-                                %recovery_error,
-                                "could not resolve orders after bootstrap failure; attempting a final cancel-all"
-                            );
                             let _ = self.cancel_all_for_recovery().await;
                             return Err(recovery_error);
                         }
@@ -223,10 +201,13 @@ impl MakerEngine {
     async fn bootstrap(&mut self, rebuild_grid: bool) -> Result<Subscriptions, EngineError> {
         let instrument = self
             .exchange
-            .instrument_spec(self.config.symbol())
+            .instrument_spec(*self.config.symbol())
             .await
             .map_err(|error| EngineError::exchange("load instrument", error))?;
         self.validate_instrument(&instrument)?;
+        self.exchange
+            .apply_instrument_spec(instrument.clone())
+            .map_err(|error| EngineError::exchange("apply instrument", error))?;
 
         let position_mode = self
             .exchange
@@ -241,35 +222,35 @@ impl MakerEngine {
         // be missed between the initial cleanup and the first order.
         let order_updates = self
             .exchange
-            .subscribe_order_updates(self.config.symbol())
+            .subscribe_order_updates(*self.config.symbol())
             .await
             .map_err(|error| EngineError::exchange("subscribe order updates", error))?;
-        let books = self
-            .exchange
-            .subscribe_best_bid_ask(self.config.symbol())
-            .await
-            .map_err(|error| EngineError::exchange("subscribe best bid/ask", error))?;
-
-        self.exchange
-            .cancel_all(self.config.symbol())
-            .await
-            .map_err(|error| EngineError::exchange("initial cancel all", error))?;
-        info!(
-            symbol = %self.config.symbol(),
-            "canceled all existing symbol orders before bootstrap"
-        );
-
         let book = self
             .exchange
-            .best_bid_ask(self.config.symbol())
+            .best_bid_ask(*self.config.symbol())
             .await
             .map_err(|error| EngineError::exchange("load initial best bid/ask", error))?;
         self.validate_book(&book)?;
+        let books = self
+            .exchange
+            .subscribe_best_bid_ask(*self.config.symbol(), book)
+            .await
+            .map_err(|error| EngineError::exchange("subscribe best bid/ask", error))?;
+        let book = books.latest().ok_or_else(|| {
+            EngineError::AdapterContract(
+                "best-bid/ask subscription did not expose its initial snapshot".to_owned(),
+            )
+        })?;
+
+        self.exchange
+            .cancel_all(*self.config.symbol())
+            .await
+            .map_err(|error| EngineError::exchange("initial cancel all", error))?;
 
         if rebuild_grid {
             self.begin_session()?;
             self.instrument = Some(instrument.clone());
-            self.latest_book = Some(book);
+            self.latest_book = Some(books.reader());
             let quantity = instrument.quantity_to_lots_exact(self.config.quantity())?;
             let grid_config = GridConfig::new(
                 self.config.levels_per_side(),
@@ -279,13 +260,6 @@ impl MakerEngine {
                 quantity,
             );
             self.grid = Some(GridModel::initialize(grid_config, &book)?);
-            info!(
-                symbol = %self.config.symbol(),
-                bid_ticks = book.bid().get(),
-                ask_ticks = book.ask().get(),
-                levels_per_side = self.config.levels_per_side().get(),
-                "initialized maker grid"
-            );
         } else {
             let current = self
                 .instrument
@@ -301,17 +275,7 @@ impl MakerEngine {
                     "cannot preserve a missing maker grid during recovery".to_owned(),
                 ));
             }
-            self.latest_book = Some(book);
-            info!(
-                symbol = %self.config.symbol(),
-                revision = self
-                    .grid
-                    .as_ref()
-                    .expect("grid presence checked above")
-                    .revision()
-                    .get(),
-                "preserved maker grid during stream recovery"
-            );
+            self.latest_book = Some(books.reader());
         }
         Ok(Subscriptions {
             order_updates,
@@ -390,32 +354,18 @@ impl MakerEngine {
                 update = subscriptions.order_updates.next() => {
                     match update {
                         Some(Ok(update)) => self.handle_order_update(update),
-                        Some(Err(error)) => {
-                            return DriveExit::Recover(format!(
-                                "order-update stream failed: {error}"
-                            ));
+                        Some(Err(_)) => {
+                            return DriveExit::Recover;
                         }
                         None => {
-                            return DriveExit::Recover(
-                                "order-update stream ended".to_owned()
-                            );
+                            return DriveExit::Recover;
                         }
                     }
                 }
-                book = subscriptions.books.next() => {
-                    match book {
-                        Some(Ok(book)) => self.accept_book(book),
-                        Some(Err(error)) => {
-                            return DriveExit::Recover(format!(
-                                "best-bid/ask stream failed: {error}"
-                            ));
-                        }
-                        None => {
-                            return DriveExit::Recover(
-                                "best-bid/ask stream ended".to_owned()
-                            );
-                        }
-                    }
+                changed = subscriptions.books.changed() => {
+                    changed.map_err(|error| {
+                        EngineError::exchange("best-bid/ask stream failed", error)
+                    })
                 }
                 completion = commands.next(), if !commands.is_empty() => {
                     self.handle_command_completion(
@@ -444,19 +394,13 @@ impl MakerEngine {
 
     fn classify_error(error: EngineError) -> DriveExit {
         if matches!(error, EngineError::InstrumentRulesChanged { .. }) {
-            return DriveExit::Rebuild(error);
+            return DriveExit::Rebuild;
         }
         if error.recommends_recovery() {
-            DriveExit::Recover(error.to_string())
+            DriveExit::Recover
         } else {
             DriveExit::Fatal(error)
         }
-    }
-
-    fn accept_book(&mut self, book: BestBidAsk) -> Result<(), EngineError> {
-        self.validate_book(&book)?;
-        self.latest_book = Some(book);
-        Ok(())
     }
 
     fn handle_order_update(&mut self, update: OrderUpdate) -> Result<(), EngineError> {
@@ -468,19 +412,6 @@ impl MakerEngine {
         {
             return Ok(());
         }
-
-        debug!(
-            symbol = %update.symbol(),
-            client_order_id = %update.client_order_id(),
-            exchange_order_id = %update.exchange_order_id(),
-            side = ?update.side(),
-            status = ?update.status(),
-            purpose = ?self.order_purpose(update.client_order_id(), update.side(), update.price()),
-            price_ticks = update.price().get(),
-            original_quantity_lots = update.original_quantity().get(),
-            cumulative_filled_lots = update.cumulative_filled().get(),
-            "received order update"
-        );
 
         if update.status() != OrderStatus::Filled {
             if self.registry.get(update.client_order_id()).is_some() {
@@ -550,12 +481,6 @@ impl MakerEngine {
             Err(GridError::LevelNotFound { .. })
                 if level.purpose() == maker_domain::GridPurpose::Quote =>
             {
-                warn!(
-                    symbol = %self.config.symbol(),
-                    side = ?level.side(),
-                    price_ticks = level.price().get(),
-                    "processing a fill for a quote retired by an earlier transition"
-                );
                 grid.apply_late_quote_fill(filled)?
             }
             result => result?,
@@ -565,28 +490,6 @@ impl MakerEngine {
         }
         self.placement_priority.extend(transition.placements());
         Ok(())
-    }
-
-    fn order_purpose(
-        &self,
-        client_order_id: &ClientOrderId,
-        side: Side,
-        price: maker_domain::PriceTicks,
-    ) -> Option<maker_domain::GridPurpose> {
-        self.registry
-            .get(client_order_id)
-            .map(|order| order.level().purpose())
-            .or_else(|| {
-                self.placement_attempts
-                    .get(client_order_id)
-                    .map(|level| level.purpose())
-            })
-            .or_else(|| {
-                self.grid
-                    .as_ref()?
-                    .level(side, price)
-                    .map(|level| level.purpose())
-            })
     }
 
     fn apply_local_reassignment(&mut self, reassignment: GridReassignment) {
@@ -730,10 +633,10 @@ impl MakerEngine {
             self.inflight_placements.insert(client_order_id);
             blocked_levels.push(level);
 
-            let exchange = self.exchange.clone();
+            let request = self.exchange.place_post_only(intent);
             commands.push(
                 async move {
-                    let result = exchange.place_post_only(intent).await;
+                    let result = request.await;
                     CommandCompletion::Place {
                         client_order_id,
                         level,
@@ -754,11 +657,11 @@ impl MakerEngine {
         kind: CancellationKind,
     ) {
         self.inflight_cancels.insert(client_order_id);
-        let exchange = self.exchange.clone();
         let symbol = *self.config.symbol();
+        let request = self.exchange.cancel_order(symbol, client_order_id);
         commands.push(
             async move {
-                let result = exchange.cancel_order(&symbol, &client_order_id).await;
+                let result = request.await;
                 CommandCompletion::Cancel {
                     client_order_id,
                     kind,
@@ -771,11 +674,11 @@ impl MakerEngine {
 
     fn schedule_instrument_refresh(&mut self, commands: &mut FuturesUnordered<CommandFuture>) {
         self.instrument_refresh_inflight = true;
-        let exchange = self.exchange.clone();
         let symbol = *self.config.symbol();
+        let request = self.exchange.refresh_instrument_spec(symbol);
         commands.push(
             async move {
-                let result = exchange.refresh_instrument_spec(&symbol).await;
+                let result = request.await;
                 CommandCompletion::InstrumentRefresh { result }
             }
             .boxed(),
@@ -810,12 +713,7 @@ impl MakerEngine {
         self.instrument_refresh_inflight = false;
         let refreshed = match refreshed {
             Ok(refreshed) => refreshed,
-            Err(error) => {
-                warn!(
-                    symbol = %self.config.symbol(),
-                    error = %error,
-                    "instrument refresh failed; retaining current trading rules"
-                );
+            Err(_) => {
                 return Ok(());
             }
         };
@@ -850,27 +748,12 @@ impl MakerEngine {
             self.placement_attempts.remove(&client_order_id);
             self.pre_ack_updates.remove(&client_order_id);
             self.unresolved_attempts.remove(&client_order_id);
-            debug!(
-                symbol = %self.config.symbol(),
-                client_order_id = %client_order_id,
-                "placement completed after its fill was already processed"
-            );
             return Ok(());
         }
 
         match result {
             Ok(ack) => {
                 self.validate_ack(&client_order_id, &ack)?;
-                info!(
-                    symbol = %self.config.symbol(),
-                    client_order_id = %client_order_id,
-                    exchange_order_id = %ack.exchange_order_id(),
-                    side = ?level.side(),
-                    purpose = ?level.purpose(),
-                    price_ticks = level.price().get(),
-                    quantity_lots = level.quantity().get(),
-                    "post-only order accepted"
-                );
                 self.registry.register(level, ack)?;
                 self.placement_attempts.remove(&client_order_id);
                 self.placement_priority
@@ -897,15 +780,6 @@ impl MakerEngine {
                     return Err(engine_error);
                 }
                 self.deferred_placements.insert(level);
-                debug!(
-                    symbol = %self.config.symbol(),
-                    client_order_id = %client_order_id,
-                    side = ?level.side(),
-                    purpose = ?level.purpose(),
-                    price_ticks = level.price().get(),
-                    error = %engine_error,
-                    "will retry placement during a later reconcile pass"
-                );
             }
         }
         Ok(())
@@ -924,19 +798,9 @@ impl MakerEngine {
                     self.unresolved_attempts.remove(&client_order_id);
                     self.placement_attempts.remove(&client_order_id);
                     self.pre_ack_updates.remove(&client_order_id);
-                    info!(
-                        symbol = %self.config.symbol(),
-                        client_order_id = %client_order_id,
-                        "resolved uncertain order cancellation"
-                    );
                 } else if self.registry.get(&client_order_id).is_some() {
                     self.registry.mark_canceled(&client_order_id)?;
                     self.registry.discard(&client_order_id);
-                    info!(
-                        symbol = %self.config.symbol(),
-                        client_order_id = %client_order_id,
-                        "canceled undesired order"
-                    );
                 }
             }
             Ok(CancelOutcome::Terminal(update)) => {
@@ -963,12 +827,6 @@ impl MakerEngine {
                     return Err(engine_error);
                 }
                 self.deferred_cancels.insert(client_order_id);
-                warn!(
-                    symbol = %self.config.symbol(),
-                    client_order_id = %client_order_id,
-                    error = %engine_error,
-                    "will retry cancel during a later reconcile pass"
-                );
             }
         }
         Ok(())
@@ -1037,7 +895,7 @@ impl MakerEngine {
     }
 
     fn level_would_rest(&self, level: GridLevel) -> bool {
-        let Some(book) = &self.latest_book else {
+        let Some(book) = self.latest_book.as_ref().and_then(LatestBbo::latest) else {
             return false;
         };
         match level.side() {
@@ -1143,7 +1001,7 @@ impl MakerEngine {
 
             let outcome = self
                 .exchange
-                .cancel_order(self.config.symbol(), &client_order_id)
+                .cancel_order(*self.config.symbol(), client_order_id)
                 .await
                 .map_err(|error| EngineError::exchange("resolve order during recovery", error))?;
 
@@ -1219,23 +1077,10 @@ impl MakerEngine {
         Ok(())
     }
 
-    async fn cancel_all_for_recovery(&self) -> Result<(), EngineError> {
-        match self.exchange.cancel_all(self.config.symbol()).await {
-            Ok(()) => {
-                info!(
-                    symbol = %self.config.symbol(),
-                    "canceled all symbol orders for recovery"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                warn!(
-                    symbol = %self.config.symbol(),
-                    error = %error,
-                    "failed to cancel all orders during recovery"
-                );
-                Err(EngineError::exchange("cancel all during recovery", error))
-            }
+    async fn cancel_all_for_recovery(&mut self) -> Result<(), EngineError> {
+        match self.exchange.cancel_all(*self.config.symbol()).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(EngineError::exchange("cancel all during recovery", error)),
         }
     }
 
@@ -1243,20 +1088,9 @@ impl MakerEngine {
         self.phase = EnginePhase::Stopping;
         let result = self
             .exchange
-            .cancel_all(self.config.symbol())
+            .cancel_all(*self.config.symbol())
             .await
             .map_err(|error| EngineError::exchange("cancel all on shutdown", error));
-        match &result {
-            Ok(()) => info!(
-                symbol = %self.config.symbol(),
-                "canceled all symbol orders on shutdown"
-            ),
-            Err(error) => warn!(
-                symbol = %self.config.symbol(),
-                error = %error,
-                "failed to cancel all symbol orders on shutdown"
-            ),
-        }
         self.registry.clear();
         self.placement_attempts.clear();
         self.inflight_placements.clear();
@@ -1340,12 +1174,12 @@ enum CommandCompletion {
 
 struct Subscriptions {
     order_updates: EventStream<OrderUpdate>,
-    books: EventStream<BestBidAsk>,
+    books: LatestBboSubscription,
 }
 
 enum DriveExit {
     Shutdown,
-    Recover(String),
-    Rebuild(EngineError),
+    Recover,
+    Rebuild,
     Fatal(EngineError),
 }

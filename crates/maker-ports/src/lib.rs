@@ -6,11 +6,17 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod latest_bbo;
+mod order_updates;
 mod ports;
 mod stream;
 mod types;
 
 pub use error::{ExchangeError, ExchangeErrorKind, ExchangeResult};
-pub use ports::{Exchange, InstrumentPort, MarketDataPort, OrderEventPort, TradingPort};
+pub use latest_bbo::{LatestBbo, LatestBboPublisher, LatestBboSubscription};
+pub use order_updates::{OrderUpdatePublisher, OrderUpdateSubscription};
+pub use ports::{
+    Exchange, ExchangeFuture, InstrumentPort, MarketDataPort, OrderEventPort, TradingPort,
+};
 pub use stream::EventStream;
 pub use types::{CancelOutcome, PlaceOrderAck, PositionMode};
