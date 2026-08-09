@@ -53,14 +53,7 @@ async fn main() -> Result<()> {
         report_receiver,
     ));
 
-    let result = strategy
-        .run_until(async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => info!("shutdown signal received"),
-                Err(error) => error!(%error, "failed to listen for shutdown signal"),
-            }
-        })
-        .await;
+    let result = strategy.run_until(shutdown_signal()).await;
     if let Err(error) = reporter.await {
         error!(%error, "runtime reporter task failed");
     }
@@ -69,6 +62,43 @@ async fn main() -> Result<()> {
         error!(error = %format!("{error:#}"), "maker strategy stopped with an error");
     }
     result.context("maker engine stopped with an error")
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            error!(%error, signal = "SIGTERM", "failed to install shutdown signal handler");
+            wait_for_ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => match result {
+            Ok(()) => info!(signal = "SIGINT", "shutdown signal received"),
+            Err(error) => error!(%error, signal = "SIGINT", "failed to listen for shutdown signal"),
+        },
+        received = terminate.recv() => match received {
+            Some(()) => info!(signal = "SIGTERM", "shutdown signal received"),
+            None => error!(signal = "SIGTERM", "shutdown signal stream ended"),
+        },
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    wait_for_ctrl_c().await;
+}
+
+async fn wait_for_ctrl_c() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => info!(signal = "SIGINT", "shutdown signal received"),
+        Err(error) => error!(%error, signal = "SIGINT", "failed to listen for shutdown signal"),
+    }
 }
 
 async fn report_telemetry(
@@ -397,6 +427,9 @@ fn log_latency(metric: &str, latency: &LatencySnapshot) {
         unit = "ns",
         samples = latency.samples,
         mean = latency.mean,
+        minimum = latency.minimum,
+        p20_upper = latency.p20_upper,
+        p30_upper = latency.p30_upper,
         p50_upper = latency.p50_upper,
         p99_upper = latency.p99_upper,
         maximum = latency.maximum,
@@ -410,6 +443,9 @@ fn log_signed_latency(metric: &str, latency: &SignedLatencySnapshot) {
         unit = "us",
         samples = latency.samples,
         mean = latency.mean,
+        minimum = latency.minimum,
+        p20_upper = latency.p20_upper,
+        p30_upper = latency.p30_upper,
         p50_upper = latency.p50_upper,
         p99_upper = latency.p99_upper,
         maximum = latency.maximum,

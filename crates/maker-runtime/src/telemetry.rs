@@ -206,11 +206,22 @@ pub fn current_event_origin() -> Option<EventOrigin> {
     EVENT_ORIGIN.with(Cell::get)
 }
 
-#[derive(Default)]
 struct UnsignedHistogram {
     buckets: [AtomicU64; UNSIGNED_BUCKET_UPPER_NS.len()],
     sum: AtomicU64,
+    minimum: AtomicU64,
     maximum: AtomicU64,
+}
+
+impl Default for UnsignedHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum: AtomicU64::new(0),
+            minimum: AtomicU64::new(u64::MAX),
+            maximum: AtomicU64::new(0),
+        }
+    }
 }
 
 impl UnsignedHistogram {
@@ -218,6 +229,7 @@ impl UnsignedHistogram {
         let index = UNSIGNED_BUCKET_UPPER_NS.partition_point(|upper| *upper < value);
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
+        self.minimum.fetch_min(value, Ordering::Relaxed);
         self.maximum.fetch_max(value, Ordering::Relaxed);
     }
 
@@ -228,10 +240,14 @@ impl UnsignedHistogram {
             .map(|bucket| bucket.swap(0, Ordering::Relaxed));
         let samples = counts.iter().sum();
         let sum = self.sum.swap(0, Ordering::Relaxed);
+        let minimum = self.minimum.swap(u64::MAX, Ordering::Relaxed);
         let maximum = self.maximum.swap(0, Ordering::Relaxed);
         LatencySnapshot {
             samples,
             mean: sum.checked_div(samples).unwrap_or(0),
+            minimum: if samples == 0 { 0 } else { minimum },
+            p20_upper: unsigned_percentile(&counts, samples, 20, maximum),
+            p30_upper: unsigned_percentile(&counts, samples, 30, maximum),
             p50_upper: unsigned_percentile(&counts, samples, 50, maximum),
             p99_upper: unsigned_percentile(&counts, samples, 99, maximum),
             maximum,
@@ -242,6 +258,7 @@ impl UnsignedHistogram {
 struct SignedHistogram {
     buckets: [AtomicU64; SIGNED_BUCKET_UPPER_US.len()],
     sum: AtomicI64,
+    minimum: AtomicI64,
     maximum: AtomicI64,
 }
 
@@ -250,6 +267,7 @@ impl Default for SignedHistogram {
         Self {
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sum: AtomicI64::new(0),
+            minimum: AtomicI64::new(i64::MAX),
             maximum: AtomicI64::new(i64::MIN),
         }
     }
@@ -260,6 +278,7 @@ impl SignedHistogram {
         let index = SIGNED_BUCKET_UPPER_US.partition_point(|upper| *upper < value);
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
+        self.minimum.fetch_min(value, Ordering::Relaxed);
         self.maximum.fetch_max(value, Ordering::Relaxed);
     }
 
@@ -270,12 +289,16 @@ impl SignedHistogram {
             .map(|bucket| bucket.swap(0, Ordering::Relaxed));
         let samples = counts.iter().sum();
         let sum = self.sum.swap(0, Ordering::Relaxed);
+        let minimum = self.minimum.swap(i64::MAX, Ordering::Relaxed);
         let maximum = self.maximum.swap(i64::MIN, Ordering::Relaxed);
         SignedLatencySnapshot {
             samples,
             mean: sum
                 .checked_div(i64::try_from(samples).unwrap_or(i64::MAX))
                 .unwrap_or(0),
+            minimum: if samples == 0 { 0 } else { minimum },
+            p20_upper: signed_percentile(&counts, samples, 20, maximum),
+            p30_upper: signed_percentile(&counts, samples, 30, maximum),
             p50_upper: signed_percentile(&counts, samples, 50, maximum),
             p99_upper: signed_percentile(&counts, samples, 99, maximum),
             maximum: if samples == 0 { 0 } else { maximum },
@@ -712,6 +735,9 @@ fn event_age(now: u64, received: u64) -> Option<u64> {
 pub struct LatencySnapshot {
     pub samples: u64,
     pub mean: u64,
+    pub minimum: u64,
+    pub p20_upper: u64,
+    pub p30_upper: u64,
     pub p50_upper: u64,
     pub p99_upper: u64,
     pub maximum: u64,
@@ -721,6 +747,9 @@ pub struct LatencySnapshot {
 pub struct SignedLatencySnapshot {
     pub samples: u64,
     pub mean: i64,
+    pub minimum: i64,
+    pub p20_upper: i64,
+    pub p30_upper: i64,
     pub p50_upper: i64,
     pub p99_upper: i64,
     pub maximum: i64,
@@ -814,6 +843,46 @@ mod tests {
         assert_eq!(snapshot.market_events, 1);
         assert_eq!(snapshot.market_event_delay_us.mean, -99_750);
         assert_eq!(snapshot.market_transaction_delay_us.mean, -49_750);
+    }
+
+    #[test]
+    fn snapshots_unsigned_minimum_and_lower_percentiles() {
+        let histogram = UnsignedHistogram::default();
+        for value in [500, 1_000, 2_000, 5_000, 10_000] {
+            histogram.observe(value);
+        }
+
+        let snapshot = histogram.take();
+        assert_eq!(snapshot.samples, 5);
+        assert_eq!(snapshot.mean, 3_700);
+        assert_eq!(snapshot.minimum, 500);
+        assert_eq!(snapshot.p20_upper, 500);
+        assert_eq!(snapshot.p30_upper, 1_000);
+        assert_eq!(snapshot.p50_upper, 2_000);
+        assert_eq!(snapshot.p99_upper, 10_000);
+        assert_eq!(snapshot.maximum, 10_000);
+
+        assert_eq!(histogram.take(), LatencySnapshot::default());
+    }
+
+    #[test]
+    fn snapshots_signed_minimum_and_lower_percentiles() {
+        let histogram = SignedHistogram::default();
+        for value in [-100, -20, 0, 10, 50] {
+            histogram.observe(value);
+        }
+
+        let snapshot = histogram.take();
+        assert_eq!(snapshot.samples, 5);
+        assert_eq!(snapshot.mean, -12);
+        assert_eq!(snapshot.minimum, -100);
+        assert_eq!(snapshot.p20_upper, -100);
+        assert_eq!(snapshot.p30_upper, -20);
+        assert_eq!(snapshot.p50_upper, 0);
+        assert_eq!(snapshot.p99_upper, 50);
+        assert_eq!(snapshot.maximum, 50);
+
+        assert_eq!(histogram.take(), SignedLatencySnapshot::default());
     }
 
     #[test]
