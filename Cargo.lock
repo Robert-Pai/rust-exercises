@@ -843,6 +843,7 @@ dependencies = [
  "futures-util",
  "maker-domain",
  "maker-ports",
+ "maker-runtime",
  "rust_decimal",
  "thiserror",
  "tokio",

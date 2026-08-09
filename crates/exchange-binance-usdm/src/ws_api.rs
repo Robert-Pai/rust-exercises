@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use maker_domain::{ClientOrderId, InstrumentSpec, OrderIntent, Side, Symbol};
 use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult};
-use maker_runtime::{SpscConsumer, SpscProducer, TryPushError, spsc_channel};
+use maker_runtime::{
+    EventOrigin, RuntimeTelemetry, SpscConsumer, SpscProducer, TryPushError, current_event_origin,
+    spsc_channel,
+};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -34,6 +37,7 @@ const TRANSPORT_ID_MASK: u64 = (TRANSPORT_ID_SLOTS as u64) - 1;
 pub(crate) struct WsApiClient {
     commands: SpscProducer<Command>,
     queue_timeout: Duration,
+    telemetry: Option<RuntimeTelemetry>,
 }
 
 struct WorkerConfig {
@@ -44,6 +48,7 @@ struct WorkerConfig {
     connect_timeout: Duration,
     response_timeout: Duration,
     request_rate_limiter: SharedRequestRateLimiter,
+    telemetry: Option<RuntimeTelemetry>,
 }
 
 struct WorkerState {
@@ -55,6 +60,9 @@ struct Command {
     parameters: Parameters,
     mode: ResponseMode,
     clock_retried: bool,
+    submitted_ns: u64,
+    origin: Option<EventOrigin>,
+    measure_dispatch: bool,
     deadline: tokio::time::Instant,
     reply: oneshot::Sender<ExchangeResult<Value>>,
 }
@@ -73,6 +81,8 @@ struct PendingRequest {
     mode: ResponseMode,
     parameters: Parameters,
     clock_retried: bool,
+    submitted_ns: u64,
+    origin: Option<EventOrigin>,
     reply: oneshot::Sender<ExchangeResult<Value>>,
 }
 
@@ -129,12 +139,14 @@ impl WsApiClient {
                 connect_timeout: config.request_timeout(),
                 response_timeout: config.request_timeout(),
                 request_rate_limiter,
+                telemetry: config.telemetry(),
             },
             receiver,
         ))?;
         Ok(Self {
             commands,
             queue_timeout,
+            telemetry: config.telemetry(),
         })
     }
 
@@ -228,16 +240,27 @@ impl WsApiClient {
         mode: ResponseMode,
     ) -> ExchangeFuture<Value> {
         let (reply, response) = oneshot::channel();
+        let submitted_ns = self
+            .telemetry
+            .as_ref()
+            .map_or(0, RuntimeTelemetry::monotonic_time_ns);
+        let origin = current_event_origin();
         let command = Command {
             method,
             parameters,
             mode,
             clock_retried: false,
+            submitted_ns,
+            origin,
+            measure_dispatch: true,
             deadline: tokio::time::Instant::now() + self.queue_timeout,
             reply,
         };
         if let Err(error) = self.commands.try_push(command) {
             return ready_error(command_enqueue_error(error));
+        }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_request_submitted(origin, submitted_ns);
         }
         Box::pin(async move {
             response.await.unwrap_or_else(|_| {
@@ -527,6 +550,9 @@ async fn dispatch(
 
     let mode = command.mode;
     let method = command.method;
+    let submitted_ns = command.submitted_ns;
+    let origin = command.origin;
+    let measure_dispatch = command.measure_dispatch;
     let recovery_parameters = command.parameters.clone();
     let mut signed = command.parameters;
     signed.insert(
@@ -574,18 +600,41 @@ async fn dispatch(
         mode,
         parameters: recovery_parameters,
         clock_retried: command.clock_retried,
+        submitted_ns,
+        origin,
         reply: command.reply,
     });
     let Some(send_timeout) = remaining(deadline) else {
         return DispatchOutcome::Reset(response_timeout_error());
     };
     match tokio::time::timeout(send_timeout, socket.send(Message::Text(payload.into()))).await {
-        Ok(Ok(())) => DispatchOutcome::Continue,
-        Ok(Err(_)) => DispatchOutcome::Reset(ExchangeError::new(
-            ExchangeErrorKind::Network,
-            "Binance WebSocket API request send failed",
-        )),
-        Err(_) => DispatchOutcome::Reset(response_timeout_error()),
+        Ok(Ok(())) => {
+            if measure_dispatch {
+                if let Some(telemetry) = &config.telemetry {
+                    telemetry.observe_request_sent(
+                        origin,
+                        submitted_ns,
+                        telemetry.monotonic_time_ns(),
+                    );
+                }
+            }
+            DispatchOutcome::Continue
+        }
+        Ok(Err(_)) => {
+            if let Some(telemetry) = &config.telemetry {
+                telemetry.observe_request_send_failure();
+            }
+            DispatchOutcome::Reset(ExchangeError::new(
+                ExchangeErrorKind::Network,
+                "Binance WebSocket API request send failed",
+            ))
+        }
+        Err(_) => {
+            if let Some(telemetry) = &config.telemetry {
+                telemetry.observe_request_send_failure();
+            }
+            DispatchOutcome::Reset(response_timeout_error())
+        }
     }
 }
 
@@ -672,6 +721,9 @@ async fn handle_message(
                     parameters: request.parameters,
                     mode: request.mode,
                     clock_retried: true,
+                    submitted_ns: request.submitted_ns,
+                    origin: request.origin,
+                    measure_dispatch: false,
                     deadline: request.deadline,
                     reply: request.reply,
                 };
@@ -701,6 +753,9 @@ async fn handle_message(
                     parameters: request.parameters,
                     mode: ResponseMode::CancelQuery,
                     clock_retried: request.clock_retried,
+                    submitted_ns: request.submitted_ns,
+                    origin: request.origin,
+                    measure_dispatch: false,
                     deadline: request.deadline,
                     reply: request.reply,
                 };

@@ -118,6 +118,10 @@ impl<T> IdMap<T> {
 pub(crate) struct IdSet(IdMap<()>);
 
 impl IdSet {
+    pub(crate) const fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub(crate) fn contains(&self, id: &ClientOrderId) -> bool {
         self.0.contains_key(id)
     }

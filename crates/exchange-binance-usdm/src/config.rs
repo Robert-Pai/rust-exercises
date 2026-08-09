@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey};
 use maker_ports::{ExchangeError, ExchangeErrorKind, ExchangeResult};
-use maker_runtime::ExecutionMode;
+use maker_runtime::{ExecutionMode, RuntimeTelemetry};
 use secrecy::{ExposeSecret, SecretString};
 
 const DEFAULT_REST_URL: &str = "https://fapi.binance.com";
@@ -82,6 +82,7 @@ pub struct BinanceUsdmConfig {
     market_data_cpu_core: Option<usize>,
     trading_mode: ExecutionMode,
     trading_cpu_core: Option<usize>,
+    telemetry: Option<RuntimeTelemetry>,
 }
 
 impl Default for BinanceUsdmConfig {
@@ -98,6 +99,7 @@ impl Default for BinanceUsdmConfig {
             market_data_cpu_core: None,
             trading_mode: ExecutionMode::BusySpin,
             trading_cpu_core: None,
+            telemetry: None,
         }
     }
 }
@@ -124,6 +126,7 @@ impl BinanceUsdmConfig {
             market_data_cpu_core: None,
             trading_mode: ExecutionMode::BusySpin,
             trading_cpu_core: None,
+            telemetry: None,
         };
         config.validate()?;
         Ok(config)
@@ -171,6 +174,15 @@ impl BinanceUsdmConfig {
 
     pub const fn trading_cpu_core(&self) -> Option<usize> {
         self.trading_cpu_core
+    }
+
+    pub(crate) fn telemetry(&self) -> Option<RuntimeTelemetry> {
+        self.telemetry.clone()
+    }
+
+    pub fn with_telemetry(mut self, telemetry: RuntimeTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     pub fn with_network_cpu_cores(

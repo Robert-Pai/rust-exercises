@@ -57,6 +57,8 @@ fn fixed_transport_slots_validate_the_full_request_id() {
         mode: ResponseMode::Direct,
         parameters: Parameters::new(),
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
         reply,
     });
 
@@ -72,6 +74,7 @@ fn request_deadline_is_assigned_synchronously_before_enqueue() {
     let mut client = WsApiClient {
         commands,
         queue_timeout: Duration::from_millis(250),
+        telemetry: None,
     };
     let before = tokio::time::Instant::now();
     let response = client.request_value("order.status", Parameters::new(), ResponseMode::Direct);
@@ -80,6 +83,32 @@ fn request_deadline_is_assigned_synchronously_before_enqueue() {
 
     assert!(command.deadline >= before + Duration::from_millis(250));
     assert!(command.deadline <= after + Duration::from_millis(250));
+    drop(response);
+}
+
+#[test]
+fn request_captures_the_event_that_caused_strategy_submission() {
+    let telemetry = RuntimeTelemetry::new();
+    let origin = maker_runtime::EventOrigin::new(
+        maker_runtime::EventSource::PrivateData,
+        telemetry.monotonic_time_ns(),
+    )
+    .unwrap();
+    let (commands, mut receiver) = spsc_channel(1);
+    let mut client = WsApiClient {
+        commands,
+        queue_timeout: Duration::from_millis(250),
+        telemetry: Some(telemetry.clone()),
+    };
+
+    let response = maker_runtime::with_event_origin(Some(origin), || {
+        client.request_value("order.status", Parameters::new(), ResponseMode::Direct)
+    });
+    let command = receiver.try_pop().unwrap();
+
+    assert_eq!(command.origin, Some(origin));
+    assert!(command.submitted_ns >= origin.received_ns());
+    assert_eq!(telemetry.take_snapshot().event_requests, 1);
     drop(response);
 }
 
@@ -106,6 +135,8 @@ fn full_pending_capacity_preserves_all_resident_requests() {
             mode: ResponseMode::Direct,
             parameters: Parameters::new(),
             clock_retried: false,
+            submitted_ns: 1,
+            origin: None,
             reply,
         });
         responses.push(response);
@@ -129,6 +160,9 @@ fn closed_and_expired_queued_commands_are_inactive() {
         parameters: Parameters::new(),
         mode: ResponseMode::Direct,
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
+        measure_dispatch: true,
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
         reply: closed_reply,
     };
@@ -140,6 +174,9 @@ fn closed_and_expired_queued_commands_are_inactive() {
         parameters: Parameters::new(),
         mode: ResponseMode::Direct,
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
+        measure_dispatch: true,
         deadline: tokio::time::Instant::now() - Duration::from_millis(1),
         reply: expired_reply,
     };
@@ -162,6 +199,8 @@ fn expired_response_is_rejected_before_processing_or_retry() {
         mode: ResponseMode::Direct,
         parameters: Parameters::new(),
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
         reply,
     });
     let request = take_pending(&mut pending, 7).unwrap();
@@ -205,6 +244,8 @@ async fn worker_deadline_cleanup_releases_only_expired_slots() {
         mode: ResponseMode::Direct,
         parameters: Parameters::new(),
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
         reply: expired_reply,
     });
     pending[transport_slot(2)] = Some(PendingRequest {
@@ -214,6 +255,8 @@ async fn worker_deadline_cleanup_releases_only_expired_slots() {
         mode: ResponseMode::Direct,
         parameters: Parameters::new(),
         clock_retried: false,
+        submitted_ns: 1,
+        origin: None,
         reply: live_reply,
     });
 
@@ -241,6 +284,8 @@ fn connection_reset_drains_every_fixed_slot() {
             mode: ResponseMode::Direct,
             parameters: Parameters::new(),
             clock_retried: false,
+            submitted_ns: 1,
+            origin: None,
             reply,
         });
     }

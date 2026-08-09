@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn maps_book_ticker_without_floating_point_rounding() {
         let wire: BookTickerEventDto =
-            serde_json::from_str(r#"{"e":"bookTicker","s":"BTCUSDT","b":"64000.1","a":"64000.2"}"#)
+            serde_json::from_str(r#"{"e":"bookTicker","E":1700000000001,"T":1700000000000,"s":"BTCUSDT","b":"64000.1","a":"64000.2"}"#)
                 .unwrap();
 
         let mapped = websocket_book(&symbol(), &spec(), wire).unwrap();
@@ -384,9 +384,16 @@ mod tests {
             }
         }"#;
         let event: PrivateEventDto = serde_json::from_str(json).unwrap();
-        let PrivateEventDto::OrderTradeUpdate { order } = event else {
+        let PrivateEventDto::OrderTradeUpdate {
+            event_time,
+            transaction_time,
+            order,
+        } = event
+        else {
             panic!("expected order event");
         };
+        assert_eq!(event_time, 1_700_000_000_000);
+        assert_eq!(transaction_time, 1_700_000_000_000);
 
         let update = websocket_order(&spec(), order).unwrap().unwrap();
 

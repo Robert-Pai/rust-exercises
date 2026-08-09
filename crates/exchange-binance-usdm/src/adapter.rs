@@ -12,8 +12,9 @@ use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, Order
 use maker_ports::{
     CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
     InstrumentPort, LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck,
-    PositionMode, TradingPort,
+    PositionMode, ReceivedOrderUpdate, TradingPort,
 };
+use maker_runtime::RuntimeTelemetry;
 
 /// Move-only Binance USD-M Futures session owned by the strategy thread.
 pub struct BinanceUsdm {
@@ -25,6 +26,7 @@ pub struct BinanceUsdm {
     websocket_connect_timeout: Duration,
     websocket_idle_timeout: Duration,
     listen_key_keepalive: Duration,
+    telemetry: Option<RuntimeTelemetry>,
     instrument: Option<InstrumentSpec>,
 }
 
@@ -43,6 +45,7 @@ impl BinanceUsdm {
             websocket_connect_timeout: config.request_timeout(),
             websocket_idle_timeout: config.websocket_idle_timeout(),
             listen_key_keepalive: config.listen_key_keepalive(),
+            telemetry: config.telemetry(),
             instrument: None,
         })
     }
@@ -121,6 +124,7 @@ impl MarketDataPort for BinanceUsdm {
         let websocket_url = self.websocket_url.clone();
         let connect_timeout = self.websocket_connect_timeout;
         let idle_timeout = self.websocket_idle_timeout;
+        let telemetry = self.telemetry.clone();
         self.market_network.call(async move {
             websocket::subscribe_book_ticker(
                 &websocket_url,
@@ -129,6 +133,7 @@ impl MarketDataPort for BinanceUsdm {
                 connect_timeout,
                 idle_timeout,
                 initial,
+                telemetry,
             )
             .await
         })
@@ -183,13 +188,14 @@ impl OrderEventPort for BinanceUsdm {
     fn subscribe_order_updates(
         &mut self,
         symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
         let spec = self.cached_instrument_spec(&symbol);
         let rest = self.rest.clone();
         let websocket_url = self.websocket_url.clone();
         let connect_timeout = self.websocket_connect_timeout;
         let idle_timeout = self.websocket_idle_timeout;
         let keepalive = self.listen_key_keepalive;
+        let telemetry = self.telemetry.clone();
         self.trading_network.call(async move {
             websocket::subscribe_order_updates(
                 rest,
@@ -199,6 +205,7 @@ impl OrderEventPort for BinanceUsdm {
                 connect_timeout,
                 idle_timeout,
                 keepalive,
+                telemetry,
             )
             .await
         })

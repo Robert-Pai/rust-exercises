@@ -1,6 +1,12 @@
 mod spsc;
+mod telemetry;
 
 pub use spsc::{SpscConsumer, SpscProducer, TryPushError, spsc_channel};
+pub use telemetry::{
+    EngineRuntimePhase, EngineState, EventOrigin, EventSource, LatencySnapshot, RuntimeTelemetry,
+    SignedLatencySnapshot, TelemetrySnapshot, current_event_origin, unix_time_ms,
+    with_event_origin,
+};
 
 use std::{
     future::Future,

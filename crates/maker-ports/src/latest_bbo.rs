@@ -24,6 +24,7 @@ struct BboSlot {
     version: AtomicU64,
     bid_ticks: AtomicU64,
     ask_ticks: AtomicU64,
+    received_ns: AtomicU64,
 }
 
 impl BboSlot {
@@ -32,10 +33,11 @@ impl BboSlot {
             version: AtomicU64::new(0),
             bid_ticks: AtomicU64::new(0),
             ask_ticks: AtomicU64::new(0),
+            received_ns: AtomicU64::new(0),
         }
     }
 
-    fn write(&self, book: BestBidAsk) {
+    fn write(&self, book: BestBidAsk, received_ns: u64) {
         let current = self.version.load(Ordering::SeqCst);
         let writing = if current & 1 == 0 {
             current.wrapping_add(1)
@@ -45,11 +47,12 @@ impl BboSlot {
         self.version.store(writing, Ordering::SeqCst);
         self.bid_ticks.store(book.bid().get(), Ordering::SeqCst);
         self.ask_ticks.store(book.ask().get(), Ordering::SeqCst);
+        self.received_ns.store(received_ns, Ordering::SeqCst);
         self.version
             .store(writing.wrapping_add(1), Ordering::SeqCst);
     }
 
-    fn read(&self) -> Option<(u64, u64)> {
+    fn read(&self) -> Option<(u64, u64, u64)> {
         for _ in 0..READ_ATTEMPTS {
             let before = self.version.load(Ordering::SeqCst);
             if before & 1 != 0 {
@@ -58,13 +61,31 @@ impl BboSlot {
             }
             let bid = self.bid_ticks.load(Ordering::SeqCst);
             let ask = self.ask_ticks.load(Ordering::SeqCst);
+            let received_ns = self.received_ns.load(Ordering::SeqCst);
             let after = self.version.load(Ordering::SeqCst);
             if before == after && after & 1 == 0 && bid != 0 && ask != 0 {
-                return Some((bid, ask));
+                return Some((bid, ask, received_ns));
             }
             std::hint::spin_loop();
         }
         None
+    }
+}
+
+/// A coherent top-of-book snapshot and its process-local network receive time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceivedBestBidAsk {
+    book: BestBidAsk,
+    received_ns: u64,
+}
+
+impl ReceivedBestBidAsk {
+    pub const fn book(self) -> BestBidAsk {
+        self.book
+    }
+
+    pub const fn received_ns(self) -> u64 {
+        self.received_ns
     }
 }
 
@@ -87,23 +108,28 @@ impl LatestBbo {
             slots: [BboSlot::empty(), BboSlot::empty()],
             symbol: *initial.symbol(),
         });
-        inner.slots[0].write(initial);
+        inner.slots[0].write(initial, 0);
         Self { inner }
     }
 
     pub fn latest(&self) -> Option<BestBidAsk> {
+        self.latest_received().map(ReceivedBestBidAsk::book)
+    }
+
+    pub fn latest_received(&self) -> Option<ReceivedBestBidAsk> {
         for _ in 0..READ_ATTEMPTS {
             let index = self.inner.published.0.load(Ordering::SeqCst);
             if index >= SLOT_COUNT {
                 return None;
             }
-            if let Some((bid, ask)) = self.inner.slots[usize::from(index)].read() {
-                return BestBidAsk::new(
+            if let Some((bid, ask, received_ns)) = self.inner.slots[usize::from(index)].read() {
+                let book = BestBidAsk::new(
                     self.inner.symbol,
                     PriceTicks::new(bid).expect("published BBO bid is positive"),
                     PriceTicks::new(ask).expect("published BBO ask is positive"),
                 )
-                .ok();
+                .ok()?;
+                return Some(ReceivedBestBidAsk { book, received_ns });
             }
             std::hint::spin_loop();
         }
@@ -140,6 +166,10 @@ pub struct LatestBboPublisher {
 
 impl LatestBboPublisher {
     pub fn publish(&mut self, book: BestBidAsk) -> ExchangeResult<()> {
+        self.publish_received(book, 0)
+    }
+
+    pub fn publish_received(&mut self, book: BestBidAsk, received_ns: u64) -> ExchangeResult<()> {
         if book.symbol() != &self.latest.inner.symbol {
             return Err(ExchangeError::new(
                 ExchangeErrorKind::InvalidResponse,
@@ -148,7 +178,7 @@ impl LatestBboPublisher {
         }
         let current = self.latest.inner.published.0.load(Ordering::SeqCst);
         let next = (current + 1) % SLOT_COUNT;
-        self.latest.inner.slots[usize::from(next)].write(book);
+        self.latest.inner.slots[usize::from(next)].write(book, received_ns);
         self.latest.inner.published.0.store(next, Ordering::SeqCst);
         self.notification.generation.fetch_add(1, Ordering::Release);
         self.notification.changed_waker.wake();
@@ -225,6 +255,10 @@ impl LatestBboSubscription {
         self.latest.latest()
     }
 
+    pub fn latest_received(&self) -> Option<ReceivedBestBidAsk> {
+        self.latest.latest_received()
+    }
+
     pub async fn changed(&mut self) -> ExchangeResult<()> {
         poll_fn(|context| self.poll_changed(context)).await
     }
@@ -292,9 +326,10 @@ mod tests {
     fn returns_the_latest_publication() {
         let (mut publisher, subscription) = LatestBboSubscription::channel(book(100));
         publisher.publish(book(101)).unwrap();
-        publisher.publish(book(102)).unwrap();
+        publisher.publish_received(book(102), 42).unwrap();
 
         assert_eq!(subscription.latest().unwrap(), book(102));
+        assert_eq!(subscription.latest_received().unwrap().received_ns(), 42);
     }
 
     #[test]

@@ -13,8 +13,8 @@ mod stream;
 mod types;
 
 pub use error::{ExchangeError, ExchangeErrorKind, ExchangeResult};
-pub use latest_bbo::{LatestBbo, LatestBboPublisher, LatestBboSubscription};
-pub use order_updates::{OrderUpdatePublisher, OrderUpdateSubscription};
+pub use latest_bbo::{LatestBbo, LatestBboPublisher, LatestBboSubscription, ReceivedBestBidAsk};
+pub use order_updates::{OrderUpdatePublisher, OrderUpdateSubscription, ReceivedOrderUpdate};
 pub use ports::{
     Exchange, ExchangeFuture, InstrumentPort, MarketDataPort, OrderEventPort, TradingPort,
 };

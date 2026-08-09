@@ -66,12 +66,30 @@ orders, then rebuilds the subscriptions. Trading-rule changes still rebuild a
 fresh grid.
 
 Logs are written to the configured `logging.directory` (default `logs/`). The
-terminal receives compact control-plane text, while `maker.log.YYYY-MM-DD`
-files receive structured JSON through an asynchronous writer. Files older than
-`logging.retention_days` are removed when the process starts. Dedicated
-strategy and network runtime paths do not call tracing or perform synchronous
-output; lifecycle logging remains outside the covered low-latency boundary.
-API keys, private keys, and signatures are never logged.
+`maker.log.YYYY-MM-DD` files receive structured JSON through an asynchronous
+writer; `logging.stdout = true` additionally enables compact terminal output.
+Files older than `logging.retention_days` are removed when the process starts.
+Every `logging.telemetry_interval_secs`, the CLI reports event/request counts,
+last-event ages, and latency distributions (samples, mean, p50 bucket upper
+bound, p99 bucket upper bound, and maximum). The same heartbeat includes the
+engine phase, current bid/ask ticks, active and in-flight lifecycle counts,
+fills, placement/cancellation outcomes, and recovery/rebuild counters.
+
+For an incoming public-market or private-user event, `t0` is captured when the
+network thread receives its WebSocket text frame. If that event causes an order
+request, `t1` is captured when the strategy submits it and `t2` after the
+trading WebSocket send future completes. `*_strategy_reaction` is `t1 - t0`,
+`event_request_dispatch_send` is `t2 - t1`, and `*_receive_to_send` is `t2 - t0`;
+response wait time is not included. Requests caused by startup, timers,
+recovery, or internal Binance retries are counted separately and do not create
+a strategy-reaction sample. Binance `E` event time and `T` transaction time are
+also compared with the local receive wall clock. These external-clock metrics
+can legitimately be negative when the host clock is ahead or behind Binance.
+
+Dedicated strategy and network runtime paths only update fixed atomic counters
+and histograms; they do not call tracing or perform synchronous output.
+Lifecycle and telemetry formatting remain outside the covered low-latency
+boundary. API keys, private keys, and signatures are never logged.
 
 ## Run
 

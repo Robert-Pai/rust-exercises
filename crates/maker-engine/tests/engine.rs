@@ -12,8 +12,9 @@ use maker_engine::{EngineConfig, MakerEngine};
 use maker_ports::{
     CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
     InstrumentPort, LatestBboPublisher, LatestBboSubscription, MarketDataPort, OrderEventPort,
-    PlaceOrderAck, PositionMode, TradingPort,
+    PlaceOrderAck, PositionMode, ReceivedOrderUpdate, TradingPort,
 };
+use maker_runtime::{EventOrigin, EventSource, current_event_origin};
 use rust_decimal::Decimal;
 use tokio::{
     sync::{Notify, Semaphore, mpsc, oneshot},
@@ -47,8 +48,9 @@ struct MockState {
     accepted: Vec<AcceptedOrder>,
     next_exchange_order_id: u64,
     place_failures: VecDeque<ExchangeError>,
-    order_senders: Vec<mpsc::UnboundedSender<ExchangeResult<OrderUpdate>>>,
+    order_senders: Vec<mpsc::UnboundedSender<ExchangeResult<ReceivedOrderUpdate>>>,
     book_publishers: Vec<LatestBboPublisher>,
+    placement_origins: Vec<Option<EventOrigin>>,
 }
 
 struct MockExchange {
@@ -217,14 +219,22 @@ impl MockExchange {
     }
 
     fn send_order_update(&self, update: OrderUpdate) {
+        self.send_order_update_received(update, 0);
+    }
+
+    fn send_order_update_received(&self, update: OrderUpdate, received_ns: u64) {
         self.state
             .lock()
             .unwrap()
             .order_senders
             .last()
             .expect("order subscription")
-            .send(Ok(update))
+            .send(Ok(ReceivedOrderUpdate::new(update, received_ns)))
             .expect("live order subscription");
+    }
+
+    fn placement_origins(&self) -> Vec<Option<EventOrigin>> {
+        self.state.lock().unwrap().placement_origins.clone()
     }
 
     fn send_book(&self, bid: u64, ask: u64) {
@@ -339,6 +349,11 @@ impl MarketDataPort for MockSession {
 
 impl TradingPort for MockSession {
     fn place_post_only(&mut self, intent: OrderIntent) -> ExchangeFuture<PlaceOrderAck> {
+        self.state
+            .lock()
+            .unwrap()
+            .placement_origins
+            .push(current_event_origin());
         self.record(Action::Place);
         let result = {
             let mut state = self.state.lock().unwrap();
@@ -405,12 +420,13 @@ impl OrderEventPort for MockSession {
     fn subscribe_order_updates(
         &mut self,
         _symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
         self.record(Action::SubscribeOrders);
         let (sender, receiver) = mpsc::unbounded_channel();
         self.state.lock().unwrap().order_senders.push(sender);
         Box::pin(async move {
-            Ok(Box::pin(UnboundedReceiverStream::new(receiver)) as EventStream<OrderUpdate>)
+            Ok(Box::pin(UnboundedReceiverStream::new(receiver))
+                as EventStream<ReceivedOrderUpdate>)
         })
     }
 }
@@ -541,7 +557,10 @@ async fn ask_fill_places_take_profit_and_far_quote() {
     exchange.wait_for_accepted(6).await;
 
     exchange.send_book(101, 102);
-    exchange.send_order_update(exchange.update_for(Side::Sell, 101, OrderStatus::Filled, 2));
+    exchange.send_order_update_received(
+        exchange.update_for(Side::Sell, 101, OrderStatus::Filled, 2),
+        42,
+    );
     exchange.wait_for_accepted(8).await;
 
     exchange.wait_for_order(Side::Buy, 100).await;
@@ -571,6 +590,11 @@ async fn ask_fill_places_take_profit_and_far_quote() {
         .find(|order| order.intent.side() == Side::Buy && order.intent.price().get() == 97)
         .unwrap();
     assert_eq!(&canceled, far_bid.intent.client_order_id());
+    assert!(exchange.placement_origins()[6..].iter().all(|origin| {
+        origin.is_some_and(|origin| {
+            origin.source() == EventSource::PrivateData && origin.received_ns() == 42
+        })
+    }));
 
     stop_engine(shutdown, task).await;
 }

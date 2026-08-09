@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use maker_domain::{BestBidAsk, InstrumentSpec, OrderUpdate, Symbol};
+use maker_domain::{BestBidAsk, InstrumentSpec, Symbol};
 use maker_ports::{
     EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult, LatestBboPublisher,
-    LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription,
+    LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription, ReceivedOrderUpdate,
 };
+use maker_runtime::{EventSource, RuntimeTelemetry, unix_time_ms};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{
@@ -25,6 +26,7 @@ pub(crate) async fn subscribe_book_ticker(
     connect_timeout: Duration,
     idle_timeout: Duration,
     initial: BestBidAsk,
+    telemetry: Option<RuntimeTelemetry>,
 ) -> ExchangeResult<LatestBboSubscription> {
     let stream_name = format!("{}@bookTicker", symbol.as_str().to_ascii_lowercase());
     let endpoint = stream_endpoint(websocket_url, &stream_name);
@@ -36,6 +38,7 @@ pub(crate) async fn subscribe_book_ticker(
         symbol,
         spec,
         idle_timeout,
+        telemetry,
     ));
     Ok(subscription)
 }
@@ -49,7 +52,8 @@ pub(crate) async fn subscribe_order_updates(
     connect_timeout: Duration,
     idle_timeout: Duration,
     keepalive_interval: Duration,
-) -> ExchangeResult<EventStream<OrderUpdate>> {
+    telemetry: Option<RuntimeTelemetry>,
+) -> ExchangeResult<EventStream<ReceivedOrderUpdate>> {
     let listen_key = rest.create_listen_key().await?;
     let endpoint = stream_endpoint(websocket_url, &listen_key);
     let socket = connect(&endpoint, connect_timeout).await?;
@@ -63,8 +67,9 @@ pub(crate) async fn subscribe_order_updates(
         listen_key,
         idle_timeout,
         keepalive_interval,
+        telemetry,
     ));
-    Ok(Box::pin(receiver) as EventStream<OrderUpdate>)
+    Ok(Box::pin(receiver) as EventStream<ReceivedOrderUpdate>)
 }
 
 async fn run_book_ticker(
@@ -73,6 +78,7 @@ async fn run_book_ticker(
     symbol: Symbol,
     spec: InstrumentSpec,
     idle_timeout: Duration,
+    telemetry: Option<RuntimeTelemetry>,
 ) {
     let terminal_error = loop {
         let message = tokio::select! {
@@ -96,15 +102,28 @@ async fn run_book_ticker(
         };
         match message {
             Ok(Message::Text(text)) => {
+                let received_ns = telemetry
+                    .as_ref()
+                    .map_or(0, RuntimeTelemetry::monotonic_time_ns);
+                let received_unix_ms = unix_time_ms();
                 let event: BookTickerEventDto = match serde_json::from_str(text.as_ref()) {
                     Ok(event) => event,
                     Err(error) => break error::invalid_response("bookTicker event", error),
                 };
+                if let Some(telemetry) = &telemetry {
+                    telemetry.observe_exchange_event(
+                        EventSource::MarketData,
+                        received_ns,
+                        received_unix_ms,
+                        event.event_time,
+                        event.transaction_time,
+                    );
+                }
                 let update = match mapping::websocket_book(&symbol, &spec, event) {
                     Ok(update) => update,
                     Err(error) => break error,
                 };
-                if let Err(error) = publisher.publish(update) {
+                if let Err(error) = publisher.publish_received(update, received_ns) {
                     break error;
                 }
             }
@@ -136,6 +155,7 @@ async fn run_order_updates(
     listen_key: String,
     idle_timeout: Duration,
     keepalive_interval: Duration,
+    telemetry: Option<RuntimeTelemetry>,
 ) {
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -159,6 +179,10 @@ async fn run_order_updates(
                 };
                 match message {
                     Ok(Message::Text(text)) => {
+                        let received_ns = telemetry
+                            .as_ref()
+                            .map_or(0, RuntimeTelemetry::monotonic_time_ns);
+                        let received_unix_ms = unix_time_ms();
                         let event: PrivateEventDto = match serde_json::from_str(text.as_ref()) {
                             Ok(event) => event,
                             Err(error) => {
@@ -166,19 +190,32 @@ async fn run_order_updates(
                             }
                         };
                         match event {
-                            PrivateEventDto::OrderTradeUpdate { order } => {
+                            PrivateEventDto::OrderTradeUpdate {
+                                event_time,
+                                transaction_time,
+                                order,
+                            } => {
                                 // Binance user-data streams are account-wide. Ignore
                                 // other symbols before consulting the single-symbol
                                 // instrument cache used by this adapter.
                                 if !is_owned_target_limit_order(&target_symbol, &order) {
                                     continue;
                                 }
+                                if let Some(telemetry) = &telemetry {
+                                    telemetry.observe_exchange_event(
+                                        EventSource::PrivateData,
+                                        received_ns,
+                                        received_unix_ms,
+                                        event_time,
+                                        transaction_time,
+                                    );
+                                }
                                 let update = match mapping::websocket_order(&spec, order) {
                                     Ok(Some(update)) => update,
                                     Ok(None) => continue,
                                     Err(error) => break error,
                                 };
-                                if let Err(error) = sender.publish(update) {
+                                if let Err(error) = sender.publish_received(update, received_ns) {
                                     if sender.is_closed() {
                                         return;
                                     }

@@ -46,3 +46,7 @@ directory = "logs"
 retention_days = 14
 # Set true to also write compact logs to stdout.
 stdout = false
+# Lock-free counters are aggregated on hot threads and logged by the CLI at
+# this interval. Local reaction/send latency is reported in nanoseconds;
+# exchange timestamp delay is reported in milliseconds.
+telemetry_interval_secs = 10

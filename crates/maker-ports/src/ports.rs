@@ -1,9 +1,10 @@
 use std::{future::Future, pin::Pin};
 
-use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, OrderUpdate, Symbol};
+use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, Symbol};
 
 use crate::{
     CancelOutcome, EventStream, ExchangeResult, LatestBboSubscription, PlaceOrderAck, PositionMode,
+    ReceivedOrderUpdate,
 };
 
 /// Owned response future returned after a strategy-thread dispatch completes.
@@ -62,7 +63,7 @@ pub trait OrderEventPort: Send {
     fn subscribe_order_updates(
         &mut self,
         symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<OrderUpdate>>;
+    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>>;
 }
 
 /// Move-only exchange session consumed by one maker strategy.
@@ -176,8 +177,8 @@ mod tests {
         fn subscribe_order_updates(
             &mut self,
             _symbol: Symbol,
-        ) -> ExchangeFuture<EventStream<OrderUpdate>> {
-            Box::pin(async { Ok(Box::pin(EmptyStream::new()) as EventStream<OrderUpdate>) })
+        ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
+            Box::pin(async { Ok(Box::pin(EmptyStream::new()) as EventStream<ReceivedOrderUpdate>) })
         }
     }
 

@@ -14,7 +14,7 @@ use maker_engine::{EngineConfig, MakerEngine};
 use maker_ports::{
     CancelOutcome, EventStream, ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboPublisher,
     LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode,
-    TradingPort,
+    ReceivedOrderUpdate, TradingPort,
 };
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot};
@@ -40,14 +40,14 @@ struct MockExchange {
     book: BestBidAsk,
     calls: Mutex<Vec<Call>>,
     next_order_id: AtomicU64,
-    order_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<OrderUpdate>>>>,
+    order_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<ReceivedOrderUpdate>>>>,
     book_publisher: BookPublisher,
 }
 
 impl MockExchange {
     fn new() -> (
         Arc<Self>,
-        mpsc::UnboundedSender<ExchangeResult<OrderUpdate>>,
+        mpsc::UnboundedSender<ExchangeResult<ReceivedOrderUpdate>>,
         BookPublisher,
     ) {
         let symbol = Symbol::new("BTCUSDT").unwrap();
@@ -193,7 +193,7 @@ impl OrderEventPort for MockSession {
     fn subscribe_order_updates(
         &mut self,
         _symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<OrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
         let receiver = self
             .order_receiver
             .lock()
@@ -201,7 +201,8 @@ impl OrderEventPort for MockSession {
             .take()
             .expect("order stream subscribed once");
         Box::pin(async move {
-            Ok(Box::pin(UnboundedReceiverStream::new(receiver)) as EventStream<OrderUpdate>)
+            Ok(Box::pin(UnboundedReceiverStream::new(receiver))
+                as EventStream<ReceivedOrderUpdate>)
         })
     }
 }
@@ -272,7 +273,8 @@ async fn same_price_quote_is_reassigned_locally_to_take_profit() {
             original_ask.1,
             OrderStatus::Filled,
             2,
-        )))
+        )
+        .into()))
         .unwrap();
     wait_for(|| exchange.placements().len() == 7).await;
     assert_eq!(
@@ -291,7 +293,8 @@ async fn same_price_quote_is_reassigned_locally_to_take_profit() {
             original_buy.1,
             OrderStatus::Filled,
             2,
-        )))
+        )
+        .into()))
         .unwrap();
     wait_for(|| exchange.placements().len() == 8).await;
     assert!(
@@ -403,7 +406,8 @@ async fn full_ask_fill_cancels_far_bid_and_places_near_bid_and_far_ask() {
             filled_exchange_id,
             OrderStatus::Filled,
             2,
-        )))
+        )
+        .into()))
         .unwrap();
     book_sender
         .lock()
@@ -469,7 +473,8 @@ async fn partial_fill_does_not_roll_the_grid() {
             exchange_order_id,
             OrderStatus::PartiallyFilled,
             1,
-        )))
+        )
+        .into()))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 

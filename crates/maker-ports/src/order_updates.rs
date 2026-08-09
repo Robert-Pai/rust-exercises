@@ -11,22 +11,62 @@ use crate::{ExchangeError, ExchangeErrorKind, ExchangeResult};
 
 /// Exclusive trading-network publisher for ordered private order updates.
 pub struct OrderUpdatePublisher {
-    updates: SpscProducer<OrderUpdate>,
+    updates: SpscProducer<ReceivedOrderUpdate>,
     terminal: SpscProducer<ExchangeError>,
+}
+
+/// An order update and the process-local time at which its WebSocket frame arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceivedOrderUpdate {
+    update: OrderUpdate,
+    received_ns: u64,
+}
+
+impl ReceivedOrderUpdate {
+    pub const fn new(update: OrderUpdate, received_ns: u64) -> Self {
+        Self {
+            update,
+            received_ns,
+        }
+    }
+
+    pub const fn update(self) -> OrderUpdate {
+        self.update
+    }
+
+    pub const fn received_ns(self) -> u64 {
+        self.received_ns
+    }
+}
+
+impl From<OrderUpdate> for ReceivedOrderUpdate {
+    fn from(update: OrderUpdate) -> Self {
+        Self::new(update, 0)
+    }
 }
 
 impl OrderUpdatePublisher {
     pub fn publish(&mut self, update: OrderUpdate) -> ExchangeResult<()> {
-        self.updates.try_push(update).map_err(|error| match error {
-            TryPushError::Full(_) => ExchangeError::new(
-                ExchangeErrorKind::ServiceUnavailable,
-                "private order-update queue is full",
-            ),
-            TryPushError::ConsumerDropped(_) => ExchangeError::new(
-                ExchangeErrorKind::Network,
-                "private order-update subscription ended",
-            ),
-        })
+        self.publish_received(update, 0)
+    }
+
+    pub fn publish_received(
+        &mut self,
+        update: OrderUpdate,
+        received_ns: u64,
+    ) -> ExchangeResult<()> {
+        self.updates
+            .try_push(ReceivedOrderUpdate::new(update, received_ns))
+            .map_err(|error| match error {
+                TryPushError::Full(_) => ExchangeError::new(
+                    ExchangeErrorKind::ServiceUnavailable,
+                    "private order-update queue is full",
+                ),
+                TryPushError::ConsumerDropped(_) => ExchangeError::new(
+                    ExchangeErrorKind::Network,
+                    "private order-update subscription ended",
+                ),
+            })
     }
 
     pub fn fail(mut self, error: ExchangeError) {
@@ -44,7 +84,7 @@ impl OrderUpdatePublisher {
 
 /// Ordered strategy-side stream backed by a bounded SPSC ring.
 pub struct OrderUpdateSubscription {
-    updates: SpscConsumer<OrderUpdate>,
+    updates: SpscConsumer<ReceivedOrderUpdate>,
     terminal: SpscConsumer<ExchangeError>,
     updates_closed: bool,
     terminated: bool,
@@ -67,7 +107,7 @@ impl OrderUpdateSubscription {
 }
 
 impl Stream for OrderUpdateSubscription {
-    type Item = ExchangeResult<OrderUpdate>;
+    type Item = ExchangeResult<ReceivedOrderUpdate>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.terminated {
@@ -131,8 +171,14 @@ mod tests {
         let overflow = publisher.publish(update(3)).unwrap_err();
         publisher.fail(overflow);
 
-        assert_eq!(subscription.next().await.unwrap().unwrap(), update(1));
-        assert_eq!(subscription.next().await.unwrap().unwrap(), update(2));
+        assert_eq!(
+            subscription.next().await.unwrap().unwrap(),
+            ReceivedOrderUpdate::from(update(1))
+        );
+        assert_eq!(
+            subscription.next().await.unwrap().unwrap(),
+            ReceivedOrderUpdate::from(update(2))
+        );
         assert_eq!(
             subscription.next().await.unwrap().unwrap_err().kind(),
             ExchangeErrorKind::ServiceUnavailable

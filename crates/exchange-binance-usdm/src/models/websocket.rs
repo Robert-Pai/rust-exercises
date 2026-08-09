@@ -2,6 +2,10 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct BookTickerEventDto<'a> {
+    #[serde(rename = "E")]
+    pub(crate) event_time: u64,
+    #[serde(rename = "T")]
+    pub(crate) transaction_time: u64,
     #[serde(borrow, rename = "s")]
     pub(crate) symbol: &'a str,
     #[serde(borrow, rename = "b")]
@@ -15,6 +19,10 @@ pub(crate) struct BookTickerEventDto<'a> {
 pub(crate) enum PrivateEventDto<'a> {
     #[serde(rename = "ORDER_TRADE_UPDATE")]
     OrderTradeUpdate {
+        #[serde(rename = "E")]
+        event_time: u64,
+        #[serde(rename = "T")]
+        transaction_time: u64,
         #[serde(borrow, rename = "o")]
         order: OrderTradeEventDto<'a>,
     },

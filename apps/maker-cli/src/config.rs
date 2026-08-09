@@ -34,6 +34,7 @@ pub struct LoggingSettings {
     retention_days: u64,
     level: LevelFilter,
     stdout: bool,
+    telemetry_interval: Duration,
 }
 
 impl LoggingSettings {
@@ -51,6 +52,10 @@ impl LoggingSettings {
 
     pub const fn stdout_enabled(&self) -> bool {
         self.stdout
+    }
+
+    pub const fn telemetry_interval(&self) -> Duration {
+        self.telemetry_interval
     }
 }
 
@@ -140,6 +145,10 @@ impl AppConfig {
             retention_days: self.logging.retention_days,
             level,
             stdout: self.logging.stdout,
+            telemetry_interval: seconds(
+                "logging.telemetry_interval_secs",
+                self.logging.telemetry_interval_secs,
+            )?,
         };
 
         let strategy_runtime = StrategyRuntimeSettings {
@@ -209,6 +218,12 @@ struct LoggingConfig {
     retention_days: u64,
     #[serde(default)]
     stdout: bool,
+    #[serde(default = "default_telemetry_interval_secs")]
+    telemetry_interval_secs: u64,
+}
+
+const fn default_telemetry_interval_secs() -> u64 {
+    10
 }
 
 pub fn config_path_from_args() -> Result<PathBuf> {
@@ -301,6 +316,7 @@ level = "info"
 directory = "logs"
 retention_days = 14
 stdout = false
+telemetry_interval_secs = 10
 "#;
 
     fn config_file(contents: &str) -> NamedTempFile {
@@ -337,6 +353,7 @@ stdout = false
         assert_eq!(logging.directory(), Path::new("logs"));
         assert_eq!(logging.retention_days(), 14);
         assert!(!logging.stdout_enabled());
+        assert_eq!(logging.telemetry_interval(), Duration::from_secs(10));
     }
 
     #[test]
@@ -346,6 +363,16 @@ stdout = false
         let (_, _, _, logging, _) = config.into_components().unwrap();
 
         assert!(logging.stdout_enabled());
+    }
+
+    #[test]
+    fn defaults_telemetry_interval_to_ten_seconds() {
+        let contents = VALID_CONFIG.replace("telemetry_interval_secs = 10\n", "");
+        let file = config_file(&contents);
+        let config = AppConfig::load(file.path()).unwrap();
+        let (_, _, _, logging, _) = config.into_components().unwrap();
+
+        assert_eq!(logging.telemetry_interval(), Duration::from_secs(10));
     }
 
     #[test]

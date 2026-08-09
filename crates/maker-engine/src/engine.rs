@@ -12,7 +12,10 @@ use maker_domain::{
 };
 use maker_ports::{
     CancelOutcome, EventStream, Exchange, ExchangeErrorKind, LatestBbo, LatestBboSubscription,
-    PlaceOrderAck, PositionMode,
+    PlaceOrderAck, PositionMode, ReceivedOrderUpdate,
+};
+use maker_runtime::{
+    EngineRuntimePhase, EngineState, EventOrigin, EventSource, RuntimeTelemetry, with_event_origin,
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
@@ -57,6 +60,7 @@ pub struct MakerEngine {
     session_seed: u32,
     session_generation: u8,
     next_order_sequence: u32,
+    telemetry: Option<RuntimeTelemetry>,
 }
 
 impl MakerEngine {
@@ -90,7 +94,14 @@ impl MakerEngine {
             session_seed,
             session_generation: 0,
             next_order_sequence: 0,
+            telemetry: None,
         }
+    }
+
+    pub fn with_telemetry(mut self, telemetry: RuntimeTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self.publish_runtime_state();
+        self
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -126,11 +137,11 @@ impl MakerEngine {
         let mut rebuild_grid = true;
 
         loop {
-            self.phase = if first_attempt {
+            self.set_phase(if first_attempt {
                 EnginePhase::Starting
             } else {
                 EnginePhase::Recovering
-            };
+            });
 
             let bootstrap_result = tokio::select! {
                 _ = shutdown.as_mut() => return self.stop().await,
@@ -140,12 +151,18 @@ impl MakerEngine {
             match bootstrap_result {
                 Ok(mut subscriptions) => {
                     first_attempt = false;
-                    self.phase = EnginePhase::Running;
+                    self.set_phase(EnginePhase::Running);
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.observe_session_started();
+                    }
 
                     match self.drive(&mut subscriptions, &mut shutdown).await {
                         DriveExit::Shutdown => return self.stop().await,
                         DriveExit::Recover => {
-                            self.phase = EnginePhase::Recovering;
+                            self.set_phase(EnginePhase::Recovering);
+                            if let Some(telemetry) = &self.telemetry {
+                                telemetry.observe_recovery_started();
+                            }
                             if let Err(error) = self.recover_stream_loss().await {
                                 let _ = self.cancel_all_for_recovery().await;
                                 return Err(error);
@@ -153,12 +170,15 @@ impl MakerEngine {
                             rebuild_grid = false;
                         }
                         DriveExit::Rebuild => {
-                            self.phase = EnginePhase::Stopping;
+                            self.set_phase(EnginePhase::Stopping);
+                            if let Some(telemetry) = &self.telemetry {
+                                telemetry.observe_rebuild_started();
+                            }
                             self.cancel_all_for_recovery().await?;
                             rebuild_grid = true;
                         }
                         DriveExit::Fatal(error) => {
-                            self.phase = EnginePhase::Stopping;
+                            self.set_phase(EnginePhase::Stopping);
                             self.cancel_all_for_recovery().await?;
                             return Err(error);
                         }
@@ -166,9 +186,15 @@ impl MakerEngine {
                 }
                 Err(error) if error.recommends_recovery() => {
                     first_attempt = false;
-                    self.phase = EnginePhase::Recovering;
+                    self.set_phase(EnginePhase::Recovering);
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.observe_recovery_started();
+                    }
                     if matches!(error, EngineError::InstrumentRulesChanged { .. }) {
                         rebuild_grid = true;
+                        if let Some(telemetry) = &self.telemetry {
+                            telemetry.observe_rebuild_started();
+                        }
                     }
                     if rebuild_grid {
                         self.cancel_all_for_recovery().await?;
@@ -185,7 +211,7 @@ impl MakerEngine {
                     }
                 }
                 Err(error) => {
-                    self.phase = EnginePhase::Stopping;
+                    self.set_phase(EnginePhase::Stopping);
                     self.cancel_all_for_recovery().await?;
                     return Err(error);
                 }
@@ -344,16 +370,22 @@ impl MakerEngine {
         instrument_refresh_timer.tick().await;
         let mut commands = FuturesUnordered::new();
 
-        if let Err(error) = self.schedule_reconcile(&mut commands) {
+        if let Err(error) = self.schedule_reconcile(&mut commands, None) {
             return Self::classify_error(error);
         }
 
         loop {
-            let result = tokio::select! {
+            let (result, origin) = tokio::select! {
                 _ = shutdown.as_mut() => return DriveExit::Shutdown,
-                update = subscriptions.order_updates.next() => {
-                    match update {
-                        Some(Ok(update)) => self.handle_order_update(update),
+                received = subscriptions.order_updates.next() => {
+                    match received {
+                        Some(Ok(received)) => {
+                            let origin = EventOrigin::new(
+                                EventSource::PrivateData,
+                                received.received_ns(),
+                            );
+                            (self.handle_order_update(received.update()), origin)
+                        }
                         Some(Err(_)) => {
                             return DriveExit::Recover;
                         }
@@ -363,30 +395,36 @@ impl MakerEngine {
                     }
                 }
                 changed = subscriptions.books.changed() => {
-                    changed.map_err(|error| {
+                    let result = changed.map_err(|error| {
                         EngineError::exchange("best-bid/ask stream failed", error)
-                    })
+                    });
+                    let origin = result.as_ref().ok().and_then(|()| {
+                        subscriptions.books.latest_received().and_then(|received| {
+                            EventOrigin::new(EventSource::MarketData, received.received_ns())
+                        })
+                    });
+                    (result, origin)
                 }
                 completion = commands.next(), if !commands.is_empty() => {
-                    self.handle_command_completion(
+                    (self.handle_command_completion(
                         completion.expect("a non-empty command set yields a completion")
-                    )
+                    ), None)
                 }
                 _ = instrument_refresh_timer.tick(), if !self.instrument_refresh_inflight => {
                     self.schedule_instrument_refresh(&mut commands);
-                    Ok(())
+                    (Ok(()), None)
                 }
                 _ = reconcile_timer.tick() => {
                     self.deferred_cancels.clear();
                     self.deferred_placements.clear();
-                    Ok(())
+                    (Ok(()), None)
                 },
             };
 
             if let Err(error) = result {
                 return Self::classify_error(error);
             }
-            if let Err(error) = self.schedule_reconcile(&mut commands) {
+            if let Err(error) = self.schedule_reconcile(&mut commands, origin) {
                 return Self::classify_error(error);
             }
         }
@@ -605,6 +643,7 @@ impl MakerEngine {
     fn schedule_reconcile(
         &mut self,
         commands: &mut FuturesUnordered<CommandFuture>,
+        origin: Option<EventOrigin>,
     ) -> Result<(), EngineError> {
         self.drain_pending_fills()?;
         let desired_levels = self.desired_levels();
@@ -624,6 +663,7 @@ impl MakerEngine {
                 commands,
                 client_order_id,
                 CancellationKind::ResolveUncertain,
+                origin,
             )?;
         }
 
@@ -641,7 +681,12 @@ impl MakerEngine {
             (left.side(), left.price()).cmp(&(right.side(), right.price()))
         });
         for (client_order_id, _) in undesired.iter().copied() {
-            self.schedule_cancel(commands, client_order_id, CancellationKind::Undesired)?;
+            self.schedule_cancel(
+                commands,
+                client_order_id,
+                CancellationKind::Undesired,
+                origin,
+            )?;
         }
 
         self.placement_priority.retain(|level| {
@@ -682,7 +727,10 @@ impl MakerEngine {
                 return Err(error);
             }
 
-            let request = self.exchange.place_post_only(intent);
+            let request = with_event_origin(origin, || self.exchange.place_post_only(intent));
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.observe_placement_submitted();
+            }
             commands.push(
                 async move {
                     let result = request.await;
@@ -696,6 +744,7 @@ impl MakerEngine {
             );
         }
 
+        self.publish_runtime_state();
         Ok(())
     }
 
@@ -723,6 +772,7 @@ impl MakerEngine {
         commands: &mut FuturesUnordered<CommandFuture>,
         client_order_id: ClientOrderId,
         kind: CancellationKind,
+        origin: Option<EventOrigin>,
     ) -> Result<(), EngineError> {
         self.inflight_cancels
             .insert(client_order_id)
@@ -730,7 +780,12 @@ impl MakerEngine {
                 storage: "inflight cancel lifecycle slots",
             })?;
         let symbol = *self.config.symbol();
-        let request = self.exchange.cancel_order(symbol, client_order_id);
+        let request = with_event_origin(origin, || {
+            self.exchange.cancel_order(symbol, client_order_id)
+        });
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_cancel_submitted();
+        }
         commands.push(
             async move {
                 let result = request.await;
@@ -811,6 +866,9 @@ impl MakerEngine {
         level: GridLevel,
         result: maker_ports::ExchangeResult<PlaceOrderAck>,
     ) -> Result<(), EngineError> {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_placement_completed(result.is_ok());
+        }
         let level = self.current_level_for(level);
         self.inflight_placements.remove(&client_order_id);
 
@@ -878,6 +936,9 @@ impl MakerEngine {
         kind: CancellationKind,
         result: maker_ports::ExchangeResult<CancelOutcome>,
     ) -> Result<(), EngineError> {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_cancel_completed(result.is_ok());
+        }
         self.inflight_cancels.remove(&client_order_id);
         match result {
             Ok(CancelOutcome::Canceled | CancelOutcome::NotFound) => {
@@ -1075,6 +1136,9 @@ impl MakerEngine {
     }
 
     fn finish_fill(&mut self, client_order_id: &ClientOrderId) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_fill_applied();
+        }
         self.registry.discard(client_order_id);
         self.placement_attempts.remove(client_order_id);
         self.pre_ack_updates.remove(client_order_id);
@@ -1208,7 +1272,7 @@ impl MakerEngine {
     }
 
     async fn stop(&mut self) -> Result<(), EngineError> {
-        self.phase = EnginePhase::Stopping;
+        self.set_phase(EnginePhase::Stopping);
         let result = self
             .exchange
             .cancel_all(*self.config.symbol())
@@ -1228,7 +1292,39 @@ impl MakerEngine {
         self.pending_fill_order.clear();
         self.instrument = None;
         self.latest_book = None;
+        self.publish_runtime_state();
         result
+    }
+
+    fn set_phase(&mut self, phase: EnginePhase) {
+        self.phase = phase;
+        if let Some(telemetry) = &self.telemetry {
+            let phase = match phase {
+                EnginePhase::Starting => EngineRuntimePhase::Starting,
+                EnginePhase::Running => EngineRuntimePhase::Running,
+                EnginePhase::Recovering => EngineRuntimePhase::Recovering,
+                EnginePhase::Stopping => EngineRuntimePhase::Stopping,
+            };
+            telemetry.set_engine_phase(phase);
+        }
+    }
+
+    fn publish_runtime_state(&self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let book = self.latest_book.as_ref().and_then(LatestBbo::latest);
+        telemetry.update_engine_state(EngineState {
+            active_orders: self.registry.len() as u64,
+            placement_attempts: self.placement_attempts.len() as u64,
+            inflight_placements: self.inflight_placements.len() as u64,
+            inflight_cancels: self.inflight_cancels.len() as u64,
+            pending_fills: self.pending_fills.len() as u64,
+            deferred_placements: self.deferred_placements.len() as u64,
+            deferred_cancels: self.deferred_cancels.len() as u64,
+            bid_ticks: book.map_or(0, |book| book.bid().get()),
+            ask_ticks: book.map_or(0, |book| book.ask().get()),
+        });
     }
 }
 
@@ -1314,7 +1410,7 @@ enum CommandCompletion {
 }
 
 struct Subscriptions {
-    order_updates: EventStream<OrderUpdate>,
+    order_updates: EventStream<ReceivedOrderUpdate>,
     books: LatestBboSubscription,
 }
 
