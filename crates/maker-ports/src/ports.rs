@@ -3,8 +3,8 @@ use std::{future::Future, pin::Pin};
 use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, Symbol};
 
 use crate::{
-    CancelOutcome, EventStream, ExchangeResult, LatestBboSubscription, PlaceOrderAck, PositionMode,
-    ReceivedOrderUpdate,
+    AccountSnapshot, CancelOutcome, EventStream, ExchangeResult, LatestBboSubscription,
+    PlaceOrderAck, PositionMode, ReceivedPrivateEvent,
 };
 
 /// Owned response future returned after a strategy-thread dispatch completes.
@@ -58,19 +58,27 @@ pub trait TradingPort: Send {
     fn cancel_all(&mut self, symbol: Symbol) -> ExchangeFuture<()>;
 }
 
-/// Private account order lifecycle updates.
+/// Read-only private account queries used for lifecycle reporting.
+pub trait AccountPort: Send {
+    fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot>;
+}
+
+/// Ordered private account, position, order, and trade events.
 pub trait OrderEventPort: Send {
     fn subscribe_order_updates(
         &mut self,
         symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>>;
+    ) -> ExchangeFuture<EventStream<ReceivedPrivateEvent>>;
 }
 
 /// Move-only exchange session consumed by one maker strategy.
-pub trait Exchange: InstrumentPort + MarketDataPort + TradingPort + OrderEventPort {}
+pub trait Exchange:
+    InstrumentPort + MarketDataPort + TradingPort + AccountPort + OrderEventPort
+{
+}
 
 impl<T> Exchange for T where
-    T: InstrumentPort + MarketDataPort + TradingPort + OrderEventPort + ?Sized
+    T: InstrumentPort + MarketDataPort + TradingPort + AccountPort + OrderEventPort + ?Sized
 {
 }
 
@@ -173,12 +181,25 @@ mod tests {
         }
     }
 
+    impl AccountPort for MockExchange {
+        fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot> {
+            Box::pin(async {
+                Ok(AccountSnapshot {
+                    balances: Vec::new(),
+                    positions: Vec::new(),
+                })
+            })
+        }
+    }
+
     impl OrderEventPort for MockExchange {
         fn subscribe_order_updates(
             &mut self,
             _symbol: Symbol,
-        ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
-            Box::pin(async { Ok(Box::pin(EmptyStream::new()) as EventStream<ReceivedOrderUpdate>) })
+        ) -> ExchangeFuture<EventStream<ReceivedPrivateEvent>> {
+            Box::pin(async {
+                Ok(Box::pin(EmptyStream::new()) as EventStream<ReceivedPrivateEvent>)
+            })
         }
     }
 

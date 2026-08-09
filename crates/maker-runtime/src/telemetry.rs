@@ -327,6 +327,7 @@ struct RuntimeTelemetryInner {
     background_requests: AtomicU64,
     requests_sent: AtomicU64,
     request_send_failures: AtomicU64,
+    reports_dropped: AtomicU64,
     last_market_receive_ns: AtomicU64,
     last_private_receive_ns: AtomicU64,
     engine_phase: AtomicU64,
@@ -371,6 +372,7 @@ impl Default for RuntimeTelemetryInner {
             background_requests: AtomicU64::new(0),
             requests_sent: AtomicU64::new(0),
             request_send_failures: AtomicU64::new(0),
+            reports_dropped: AtomicU64::new(0),
             last_market_receive_ns: AtomicU64::new(0),
             last_private_receive_ns: AtomicU64::new(0),
             engine_phase: AtomicU64::new(EngineRuntimePhase::Starting as u64),
@@ -499,6 +501,10 @@ impl RuntimeTelemetry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn observe_report_dropped(&self) {
+        self.inner.reports_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_engine_phase(&self, phase: EngineRuntimePhase) {
         self.inner
             .engine_phase
@@ -590,6 +596,7 @@ impl RuntimeTelemetry {
             background_requests: self.inner.background_requests.swap(0, Ordering::Relaxed),
             requests_sent: self.inner.requests_sent.swap(0, Ordering::Relaxed),
             request_send_failures: self.inner.request_send_failures.swap(0, Ordering::Relaxed),
+            reports_dropped: self.inner.reports_dropped.swap(0, Ordering::Relaxed),
             engine_phase: EngineRuntimePhase::from_atomic(
                 self.inner.engine_phase.load(Ordering::Relaxed) as u8,
             ),
@@ -675,6 +682,7 @@ pub struct TelemetrySnapshot {
     pub background_requests: u64,
     pub requests_sent: u64,
     pub request_send_failures: u64,
+    pub reports_dropped: u64,
     pub engine_phase: EngineRuntimePhase,
     pub sessions_started: u64,
     pub recoveries_started: u64,

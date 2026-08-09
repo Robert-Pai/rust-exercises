@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 const COVERED_FILES: &[&str] = &[
     "crates/maker-engine/src/engine.rs",
+    "crates/maker-engine/src/reporting.rs",
     "crates/maker-runtime/src/telemetry.rs",
     "crates/maker-ports/src/latest_bbo.rs",
     "crates/maker-ports/src/order_updates.rs",

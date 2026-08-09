@@ -14,6 +14,19 @@ fn signature_payload_is_sorted_and_uses_wire_values() {
 }
 
 #[test]
+fn account_v2_queries_reserve_the_documented_request_weight() {
+    let balance = request_cost("v2/account.balance");
+    let status = request_cost("v2/account.status");
+
+    assert_eq!(balance.raw_requests, 1);
+    assert_eq!(balance.request_weight, 5);
+    assert_eq!(balance.orders, 0);
+    assert_eq!(status.raw_requests, 1);
+    assert_eq!(status.request_weight, 5);
+    assert_eq!(status.orders, 0);
+}
+
+#[test]
 fn parses_websocket_rate_limit_telemetry() {
     let response: WsApiResponse = serde_json::from_str(
         r#"{

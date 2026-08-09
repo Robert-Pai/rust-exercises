@@ -10,12 +10,13 @@ use maker_domain::{
     BestBidAsk, ClientOrderId, ExchangeOrderId, FilledLots, InstrumentSpec, MarketKind,
     OrderIntent, OrderStatus, OrderUpdate, PriceTicks, Side, Symbol,
 };
-use maker_engine::{EngineConfig, MakerEngine};
+use maker_engine::{AccountSnapshotStage, EngineConfig, EngineReport, MakerEngine};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboPublisher,
-    LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode,
-    ReceivedOrderUpdate, TradingPort,
+    AccountPort, AccountSnapshot, CancelOutcome, EventStream, ExchangeFuture, ExchangeResult,
+    InstrumentPort, LatestBboPublisher, LatestBboSubscription, MarketDataPort, OrderEventPort,
+    PlaceOrderAck, PositionMode, ReceivedPrivateEvent, TradingPort,
 };
+use maker_runtime::spsc_channel;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -40,14 +41,14 @@ struct MockExchange {
     book: BestBidAsk,
     calls: Mutex<Vec<Call>>,
     next_order_id: AtomicU64,
-    order_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<ReceivedOrderUpdate>>>>,
+    order_receiver: Mutex<Option<mpsc::UnboundedReceiver<ExchangeResult<ReceivedPrivateEvent>>>>,
     book_publisher: BookPublisher,
 }
 
 impl MockExchange {
     fn new() -> (
         Arc<Self>,
-        mpsc::UnboundedSender<ExchangeResult<ReceivedOrderUpdate>>,
+        mpsc::UnboundedSender<ExchangeResult<ReceivedPrivateEvent>>,
         BookPublisher,
     ) {
         let symbol = Symbol::new("BTCUSDT").unwrap();
@@ -189,11 +190,22 @@ impl TradingPort for MockSession {
     }
 }
 
+impl AccountPort for MockSession {
+    fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot> {
+        Box::pin(async {
+            Ok(AccountSnapshot {
+                balances: Vec::new(),
+                positions: Vec::new(),
+            })
+        })
+    }
+}
+
 impl OrderEventPort for MockSession {
     fn subscribe_order_updates(
         &mut self,
         _symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedPrivateEvent>> {
         let receiver = self
             .order_receiver
             .lock()
@@ -202,7 +214,7 @@ impl OrderEventPort for MockSession {
             .expect("order stream subscribed once");
         Box::pin(async move {
             Ok(Box::pin(UnboundedReceiverStream::new(receiver))
-                as EventStream<ReceivedOrderUpdate>)
+                as EventStream<ReceivedPrivateEvent>)
         })
     }
 }
@@ -483,4 +495,42 @@ async fn partial_fill_does_not_roll_the_grid() {
 
     shutdown_sender.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn reports_account_snapshots_before_startup_and_after_shutdown() {
+    let (exchange, _order_sender, _book_sender) = MockExchange::new();
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let (reports, mut report_receiver) = spsc_channel(2);
+    let mut engine = MakerEngine::new(engine_config(), Box::new(MockSession(exchange.clone())))
+        .with_reporter(reports);
+    let task = tokio::spawn(async move {
+        engine
+            .run(async {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    wait_for(|| exchange.placements().len() == 6).await;
+    shutdown_sender.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    let startup = report_receiver.recv().await.unwrap();
+    let shutdown = report_receiver.recv().await.unwrap();
+    assert!(matches!(
+        startup,
+        EngineReport::AccountSnapshot {
+            stage: AccountSnapshotStage::Startup,
+            result: Ok(_),
+        }
+    ));
+    assert!(matches!(
+        shutdown,
+        EngineReport::AccountSnapshot {
+            stage: AccountSnapshotStage::Shutdown,
+            result: Ok(_),
+        }
+    ));
+    assert!(report_receiver.recv().await.is_none());
 }

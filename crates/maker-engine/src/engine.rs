@@ -12,15 +12,16 @@ use maker_domain::{
 };
 use maker_ports::{
     CancelOutcome, EventStream, Exchange, ExchangeErrorKind, LatestBbo, LatestBboSubscription,
-    PlaceOrderAck, PositionMode, ReceivedOrderUpdate,
+    PlaceOrderAck, PositionMode, PrivateEvent, ReceivedPrivateEvent,
 };
 use maker_runtime::{
-    EngineRuntimePhase, EngineState, EventOrigin, EventSource, RuntimeTelemetry, with_event_origin,
+    EngineRuntimePhase, EngineState, EventOrigin, EventSource, RuntimeTelemetry, SpscProducer,
+    TryPushError, with_event_origin,
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use crate::storage::{FixedVec, IdMap, IdSet, LIFECYCLE_CAPACITY, MAX_GRID_LEVELS};
-use crate::{EngineConfig, EngineError, OrderRegistry};
+use crate::{AccountSnapshotStage, EngineConfig, EngineError, EngineReport, OrderRegistry};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SESSION_MASK: u64 = u32::MAX as u64;
@@ -61,6 +62,7 @@ pub struct MakerEngine {
     session_generation: u8,
     next_order_sequence: u32,
     telemetry: Option<RuntimeTelemetry>,
+    reporter: Option<SpscProducer<EngineReport>>,
 }
 
 impl MakerEngine {
@@ -95,12 +97,18 @@ impl MakerEngine {
             session_generation: 0,
             next_order_sequence: 0,
             telemetry: None,
+            reporter: None,
         }
     }
 
     pub fn with_telemetry(mut self, telemetry: RuntimeTelemetry) -> Self {
         self.telemetry = Some(telemetry);
         self.publish_runtime_state();
+        self
+    }
+
+    pub fn with_reporter(mut self, reporter: SpscProducer<EngineReport>) -> Self {
+        self.reporter = Some(reporter);
         self
     }
 
@@ -132,6 +140,18 @@ impl MakerEngine {
         self.exchange
             .start()
             .map_err(|error| EngineError::exchange("start exchange session", error))?;
+        self.publish_account_snapshot(AccountSnapshotStage::Startup)
+            .await;
+        let result = self.run_started(shutdown).await;
+        self.publish_account_snapshot(AccountSnapshotStage::Shutdown)
+            .await;
+        result
+    }
+
+    async fn run_started<F>(&mut self, shutdown: F) -> Result<(), EngineError>
+    where
+        F: Future<Output = ()> + Send,
+    {
         let mut shutdown = Box::pin(shutdown);
         let mut first_attempt = true;
         let mut rebuild_grid = true;
@@ -380,11 +400,27 @@ impl MakerEngine {
                 received = subscriptions.order_updates.next() => {
                     match received {
                         Some(Ok(received)) => {
-                            let origin = EventOrigin::new(
-                                EventSource::PrivateData,
-                                received.received_ns(),
-                            );
-                            (self.handle_order_update(received.update()), origin)
+                            let received_ns = received.received_ns();
+                            match received.into_event() {
+                                PrivateEvent::OrderUpdate { update, trade } => {
+                                    if let Some(trade) = trade {
+                                        self.publish_report(EngineReport::OrderTrade(trade));
+                                    }
+                                    let origin = EventOrigin::new(
+                                        EventSource::PrivateData,
+                                        received_ns,
+                                    );
+                                    (self.handle_order_update(update), origin)
+                                }
+                                PrivateEvent::AccountUpdate(update) => {
+                                    self.publish_report(EngineReport::AccountUpdate(update));
+                                    (Ok(()), None)
+                                }
+                                PrivateEvent::TradeLite(trade) => {
+                                    self.publish_report(EngineReport::TradeLite(trade));
+                                    (Ok(()), None)
+                                }
+                            }
                         }
                         Some(Err(_)) => {
                             return DriveExit::Recover;
@@ -438,6 +474,29 @@ impl MakerEngine {
             DriveExit::Recover
         } else {
             DriveExit::Fatal(error)
+        }
+    }
+
+    async fn publish_account_snapshot(&mut self, stage: AccountSnapshotStage) {
+        if self.reporter.is_none() {
+            return;
+        }
+        let result = self.exchange.account_snapshot().await;
+        self.publish_report(EngineReport::AccountSnapshot { stage, result });
+    }
+
+    fn publish_report(&mut self, report: EngineReport) {
+        let Some(reporter) = &mut self.reporter else {
+            return;
+        };
+        if let Err(error) = reporter.try_push(report) {
+            match error {
+                TryPushError::Full(_) | TryPushError::ConsumerDropped(_) => {
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.observe_report_dropped();
+                    }
+                }
+            }
         }
     }
 
@@ -1410,7 +1469,7 @@ enum CommandCompletion {
 }
 
 struct Subscriptions {
-    order_updates: EventStream<ReceivedOrderUpdate>,
+    order_updates: EventStream<ReceivedPrivateEvent>,
     books: LatestBboSubscription,
 }
 

@@ -14,9 +14,17 @@ mod types;
 
 pub use error::{ExchangeError, ExchangeErrorKind, ExchangeResult};
 pub use latest_bbo::{LatestBbo, LatestBboPublisher, LatestBboSubscription, ReceivedBestBidAsk};
-pub use order_updates::{OrderUpdatePublisher, OrderUpdateSubscription, ReceivedOrderUpdate};
+pub use order_updates::{
+    OrderUpdatePublisher, OrderUpdateSubscription, PrivateEvent, ReceivedOrderUpdate,
+    ReceivedPrivateEvent,
+};
 pub use ports::{
-    Exchange, ExchangeFuture, InstrumentPort, MarketDataPort, OrderEventPort, TradingPort,
+    AccountPort, Exchange, ExchangeFuture, InstrumentPort, MarketDataPort, OrderEventPort,
+    TradingPort,
 };
 pub use stream::EventStream;
-pub use types::{CancelOutcome, PlaceOrderAck, PositionMode};
+pub use types::{
+    AccountBalance, AccountPosition, AccountPositionSide, AccountSnapshot, AccountUpdate,
+    AccountUpdateReason, BalanceUpdate, CancelOutcome, MarginType, OrderTradeExecution,
+    PlaceOrderAck, PositionMode, PositionUpdate, TradeLiteExecution,
+};

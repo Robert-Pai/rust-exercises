@@ -7,11 +7,14 @@ use futures_core::Stream;
 use maker_domain::OrderUpdate;
 use maker_runtime::{SpscConsumer, SpscProducer, TryPushError, spsc_channel};
 
-use crate::{ExchangeError, ExchangeErrorKind, ExchangeResult};
+use crate::{
+    AccountUpdate, ExchangeError, ExchangeErrorKind, ExchangeResult, OrderTradeExecution,
+    TradeLiteExecution,
+};
 
-/// Exclusive trading-network publisher for ordered private order updates.
+/// Exclusive trading-network publisher for ordered private user-data events.
 pub struct OrderUpdatePublisher {
-    updates: SpscProducer<ReceivedOrderUpdate>,
+    updates: SpscProducer<ReceivedPrivateEvent>,
     terminal: SpscProducer<ExchangeError>,
 }
 
@@ -45,6 +48,60 @@ impl From<OrderUpdate> for ReceivedOrderUpdate {
     }
 }
 
+/// A normalized event received from the account-wide Binance user-data stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrivateEvent {
+    OrderUpdate {
+        update: OrderUpdate,
+        trade: Option<OrderTradeExecution>,
+    },
+    AccountUpdate(AccountUpdate),
+    TradeLite(TradeLiteExecution),
+}
+
+/// A private event and the process-local time at which its WebSocket frame arrived.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceivedPrivateEvent {
+    event: PrivateEvent,
+    received_ns: u64,
+}
+
+impl ReceivedPrivateEvent {
+    pub const fn new(event: PrivateEvent, received_ns: u64) -> Self {
+        Self { event, received_ns }
+    }
+
+    pub const fn event(&self) -> &PrivateEvent {
+        &self.event
+    }
+
+    pub fn into_event(self) -> PrivateEvent {
+        self.event
+    }
+
+    pub const fn received_ns(&self) -> u64 {
+        self.received_ns
+    }
+}
+
+impl From<ReceivedOrderUpdate> for ReceivedPrivateEvent {
+    fn from(received: ReceivedOrderUpdate) -> Self {
+        Self::new(
+            PrivateEvent::OrderUpdate {
+                update: received.update(),
+                trade: None,
+            },
+            received.received_ns(),
+        )
+    }
+}
+
+impl From<OrderUpdate> for ReceivedPrivateEvent {
+    fn from(update: OrderUpdate) -> Self {
+        ReceivedOrderUpdate::from(update).into()
+    }
+}
+
 impl OrderUpdatePublisher {
     pub fn publish(&mut self, update: OrderUpdate) -> ExchangeResult<()> {
         self.publish_received(update, 0)
@@ -55,16 +112,26 @@ impl OrderUpdatePublisher {
         update: OrderUpdate,
         received_ns: u64,
     ) -> ExchangeResult<()> {
+        self.publish_event(
+            PrivateEvent::OrderUpdate {
+                update,
+                trade: None,
+            },
+            received_ns,
+        )
+    }
+
+    pub fn publish_event(&mut self, event: PrivateEvent, received_ns: u64) -> ExchangeResult<()> {
         self.updates
-            .try_push(ReceivedOrderUpdate::new(update, received_ns))
+            .try_push(ReceivedPrivateEvent::new(event, received_ns))
             .map_err(|error| match error {
                 TryPushError::Full(_) => ExchangeError::new(
                     ExchangeErrorKind::ServiceUnavailable,
-                    "private order-update queue is full",
+                    "private user-data queue is full",
                 ),
                 TryPushError::ConsumerDropped(_) => ExchangeError::new(
                     ExchangeErrorKind::Network,
-                    "private order-update subscription ended",
+                    "private user-data subscription ended",
                 ),
             })
     }
@@ -84,7 +151,7 @@ impl OrderUpdatePublisher {
 
 /// Ordered strategy-side stream backed by a bounded SPSC ring.
 pub struct OrderUpdateSubscription {
-    updates: SpscConsumer<ReceivedOrderUpdate>,
+    updates: SpscConsumer<ReceivedPrivateEvent>,
     terminal: SpscConsumer<ExchangeError>,
     updates_closed: bool,
     terminated: bool,
@@ -107,7 +174,7 @@ impl OrderUpdateSubscription {
 }
 
 impl Stream for OrderUpdateSubscription {
-    type Item = ExchangeResult<ReceivedOrderUpdate>;
+    type Item = ExchangeResult<ReceivedPrivateEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.terminated {
@@ -131,7 +198,7 @@ impl Stream for OrderUpdateSubscription {
                 self.terminated = true;
                 Poll::Ready(Some(Err(ExchangeError::new(
                     ExchangeErrorKind::Network,
-                    "private order-update publisher ended",
+                    "private user-data publisher ended",
                 ))))
             }
             Poll::Pending => Poll::Pending,
@@ -173,11 +240,11 @@ mod tests {
 
         assert_eq!(
             subscription.next().await.unwrap().unwrap(),
-            ReceivedOrderUpdate::from(update(1))
+            ReceivedPrivateEvent::from(update(1))
         );
         assert_eq!(
             subscription.next().await.unwrap().unwrap(),
-            ReceivedOrderUpdate::from(update(2))
+            ReceivedPrivateEvent::from(update(2))
         );
         assert_eq!(
             subscription.next().await.unwrap().unwrap_err().kind(),

@@ -9,8 +9,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use exchange_binance_usdm::BinanceUsdm;
-use maker_engine::MakerEngine;
-use maker_runtime::{LatencySnapshot, RuntimeTelemetry, SignedLatencySnapshot, TelemetrySnapshot};
+use maker_engine::{EngineReport, MakerEngine};
+use maker_runtime::{
+    LatencySnapshot, RuntimeTelemetry, SignedLatencySnapshot, SpscConsumer, TelemetrySnapshot,
+    spsc_channel,
+};
 use tracing::{error, info};
 use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -38,13 +41,16 @@ async fn main() -> Result<()> {
         credentials,
     )
     .context("failed to create Binance USD-M adapter")?;
-    let engine =
-        MakerEngine::new(engine_config, Box::new(exchange)).with_telemetry(telemetry.clone());
+    let (reports, report_receiver) = spsc_channel(1_024);
+    let engine = MakerEngine::new(engine_config, Box::new(exchange))
+        .with_telemetry(telemetry.clone())
+        .with_reporter(reports);
     let strategy = strategy_runtime::spawn(engine, strategy_settings)
         .context("failed to start maker strategy thread")?;
     let reporter = tokio::spawn(report_telemetry(
         telemetry.clone(),
         logging.telemetry_interval(),
+        report_receiver,
     ));
 
     let result = strategy
@@ -55,7 +61,9 @@ async fn main() -> Result<()> {
             }
         })
         .await;
-    reporter.abort();
+    if let Err(error) = reporter.await {
+        error!(%error, "runtime reporter task failed");
+    }
     log_telemetry_snapshot(&telemetry.take_snapshot(), logging.telemetry_interval());
     if let Err(error) = &result {
         error!(error = %format!("{error:#}"), "maker strategy stopped with an error");
@@ -63,13 +71,159 @@ async fn main() -> Result<()> {
     result.context("maker engine stopped with an error")
 }
 
-async fn report_telemetry(telemetry: RuntimeTelemetry, period: Duration) {
+async fn report_telemetry(
+    telemetry: RuntimeTelemetry,
+    period: Duration,
+    mut reports: SpscConsumer<EngineReport>,
+) {
     let mut timer = tokio::time::interval(period);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     timer.tick().await;
     loop {
-        timer.tick().await;
-        log_telemetry_snapshot(&telemetry.take_snapshot(), period);
+        tokio::select! {
+            _ = timer.tick() => {
+                log_telemetry_snapshot(&telemetry.take_snapshot(), period);
+            }
+            report = reports.recv() => {
+                let Some(report) = report else {
+                    return;
+                };
+                log_engine_report(report);
+            }
+        }
+    }
+}
+
+fn log_engine_report(report: EngineReport) {
+    match report {
+        EngineReport::AccountSnapshot { stage, result } => match result {
+            Ok(snapshot) => {
+                info!(
+                    stage = stage.as_str(),
+                    balances = snapshot.balances.len(),
+                    positions = snapshot.positions.len(),
+                    "Binance account snapshot"
+                );
+                for balance in snapshot.balances {
+                    info!(
+                        stage = stage.as_str(),
+                        asset = %balance.asset,
+                        wallet_balance = %balance.wallet_balance,
+                        cross_wallet_balance = %balance.cross_wallet_balance,
+                        cross_unrealized_pnl = %balance.cross_unrealized_pnl,
+                        available_balance = %balance.available_balance,
+                        max_withdraw_amount = %balance.max_withdraw_amount,
+                        ?balance.margin_available,
+                        update_time_ms = balance.update_time_ms,
+                        "Binance account balance"
+                    );
+                }
+                for position in snapshot.positions {
+                    info!(
+                        stage = stage.as_str(),
+                        symbol = %position.symbol,
+                        position_side = position.position_side.as_str(),
+                        position_amount = %position.position_amount,
+                        unrealized_pnl = %position.unrealized_pnl,
+                        isolated_margin = %position.isolated_margin,
+                        notional = %position.notional,
+                        isolated_wallet = %position.isolated_wallet,
+                        initial_margin = %position.initial_margin,
+                        maintenance_margin = %position.maintenance_margin,
+                        update_time_ms = position.update_time_ms,
+                        "Binance account position"
+                    );
+                }
+            }
+            Err(error) => {
+                error!(
+                    stage = stage.as_str(),
+                    %error,
+                    "failed to load Binance account snapshot"
+                );
+            }
+        },
+        EngineReport::AccountUpdate(update) => {
+            info!(
+                event_time_ms = update.event_time_ms,
+                transaction_time_ms = update.transaction_time_ms,
+                reason = update.reason.as_str(),
+                balances = update.balances.len(),
+                positions = update.positions.len(),
+                "Binance account update"
+            );
+            for balance in update.balances {
+                info!(
+                    event_time_ms = update.event_time_ms,
+                    transaction_time_ms = update.transaction_time_ms,
+                    reason = update.reason.as_str(),
+                    asset = %balance.asset,
+                    wallet_balance = %balance.wallet_balance,
+                    cross_wallet_balance = %balance.cross_wallet_balance,
+                    balance_change = %balance.balance_change,
+                    "Binance balance update"
+                );
+            }
+            for position in update.positions {
+                info!(
+                    event_time_ms = update.event_time_ms,
+                    transaction_time_ms = update.transaction_time_ms,
+                    reason = update.reason.as_str(),
+                    symbol = %position.symbol,
+                    position_side = position.position_side.as_str(),
+                    position_amount = %position.position_amount,
+                    entry_price = %position.entry_price,
+                    breakeven_price = %position.breakeven_price,
+                    accumulated_realized_pnl = %position.accumulated_realized_pnl,
+                    unrealized_pnl = %position.unrealized_pnl,
+                    margin_type = position.margin_type.as_str(),
+                    isolated_wallet = %position.isolated_wallet,
+                    "Binance position update"
+                );
+            }
+        }
+        EngineReport::OrderTrade(trade) => {
+            let update = trade.update;
+            info!(
+                event = "ORDER_TRADE_UPDATE",
+                event_time_ms = trade.event_time_ms,
+                transaction_time_ms = trade.transaction_time_ms,
+                trade_time_ms = trade.trade_time_ms,
+                symbol = %update.symbol(),
+                client_order_id = update.client_order_id().get(),
+                exchange_order_id = update.exchange_order_id().get(),
+                side = ?update.side(),
+                status = ?update.status(),
+                average_price = %trade.average_price,
+                last_filled_price = %trade.last_filled_price,
+                last_filled_quantity = %trade.last_filled_quantity,
+                cumulative_filled_quantity = %trade.cumulative_filled_quantity,
+                commission_asset = ?trade.commission_asset,
+                commission = ?trade.commission,
+                trade_id = trade.trade_id,
+                realized_pnl = %trade.realized_pnl,
+                maker = trade.maker,
+                "Binance trade update"
+            );
+        }
+        EngineReport::TradeLite(trade) => {
+            info!(
+                event = "TRADE_LITE",
+                event_time_ms = trade.event_time_ms,
+                transaction_time_ms = trade.transaction_time_ms,
+                symbol = %trade.symbol,
+                client_order_id = trade.client_order_id.get(),
+                exchange_order_id = trade.exchange_order_id.get(),
+                side = ?trade.side,
+                original_quantity = %trade.original_quantity,
+                original_price = %trade.original_price,
+                last_filled_price = %trade.last_filled_price,
+                last_filled_quantity = %trade.last_filled_quantity,
+                trade_id = trade.trade_id,
+                maker = trade.maker,
+                "Binance Trade Lite execution"
+            );
+        }
     }
 }
 
@@ -88,6 +242,7 @@ fn log_telemetry_snapshot(snapshot: &TelemetrySnapshot, period: Duration) {
         background_requests = snapshot.background_requests,
         requests_sent = snapshot.requests_sent,
         request_send_failures = snapshot.request_send_failures,
+        reports_dropped = snapshot.reports_dropped,
         sessions_started = snapshot.sessions_started,
         recoveries_started = snapshot.recoveries_started,
         rebuilds_started = snapshot.rebuilds_started,

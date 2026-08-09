@@ -16,7 +16,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use crate::{
     config::{BinanceCredentials, BinanceUsdmConfig},
     error,
-    models::{ApiErrorDto, RateLimitDto, WsApiOrderAckDto, WsApiOrderDto},
+    models::{
+        ApiErrorDto, RateLimitDto, WsApiAccountBalanceDto, WsApiAccountStatusDto, WsApiOrderAckDto,
+        WsApiOrderDto,
+    },
     network::NetworkRuntime,
     rate_limit::{
         AcquireDecision, RateLimitSnapshot, RequestCost, RequestRateLimiter,
@@ -185,6 +188,14 @@ impl WsApiClient {
             (Err(error), _) | (_, Err(error)) => return ready_error(error),
         };
         self.request("order.place", parameters)
+    }
+
+    pub(crate) fn account_balance_v2(&mut self) -> ExchangeFuture<Vec<WsApiAccountBalanceDto>> {
+        self.request("v2/account.balance", Parameters::new())
+    }
+
+    pub(crate) fn account_status_v2(&mut self) -> ExchangeFuture<WsApiAccountStatusDto> {
+        self.request("v2/account.status", Parameters::new())
     }
 
     pub(crate) fn cancel_order(
@@ -455,6 +466,7 @@ fn queue_timeout(response_timeout: Duration) -> Duration {
 fn request_cost(method: &str) -> RequestCost {
     match method {
         "order.place" | "order.cancel" => RequestCost::ORDER,
+        "v2/account.balance" | "v2/account.status" => RequestCost::ACCOUNT_QUERY,
         _ => RequestCost::GENERIC,
     }
 }

@@ -10,9 +10,10 @@ use maker_domain::{
 };
 use maker_engine::{EngineConfig, MakerEngine};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
-    InstrumentPort, LatestBboPublisher, LatestBboSubscription, MarketDataPort, OrderEventPort,
-    PlaceOrderAck, PositionMode, ReceivedOrderUpdate, TradingPort,
+    AccountPort, AccountSnapshot, CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind,
+    ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboPublisher, LatestBboSubscription,
+    MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode, ReceivedOrderUpdate,
+    ReceivedPrivateEvent, TradingPort,
 };
 use maker_runtime::{EventOrigin, EventSource, current_event_origin};
 use rust_decimal::Decimal;
@@ -48,7 +49,7 @@ struct MockState {
     accepted: Vec<AcceptedOrder>,
     next_exchange_order_id: u64,
     place_failures: VecDeque<ExchangeError>,
-    order_senders: Vec<mpsc::UnboundedSender<ExchangeResult<ReceivedOrderUpdate>>>,
+    order_senders: Vec<mpsc::UnboundedSender<ExchangeResult<ReceivedPrivateEvent>>>,
     book_publishers: Vec<LatestBboPublisher>,
     placement_origins: Vec<Option<EventOrigin>>,
 }
@@ -229,7 +230,7 @@ impl MockExchange {
             .order_senders
             .last()
             .expect("order subscription")
-            .send(Ok(ReceivedOrderUpdate::new(update, received_ns)))
+            .send(Ok(ReceivedOrderUpdate::new(update, received_ns).into()))
             .expect("live order subscription");
     }
 
@@ -416,17 +417,28 @@ impl TradingPort for MockSession {
     }
 }
 
+impl AccountPort for MockSession {
+    fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot> {
+        Box::pin(async {
+            Ok(AccountSnapshot {
+                balances: Vec::new(),
+                positions: Vec::new(),
+            })
+        })
+    }
+}
+
 impl OrderEventPort for MockSession {
     fn subscribe_order_updates(
         &mut self,
         _symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedPrivateEvent>> {
         self.record(Action::SubscribeOrders);
         let (sender, receiver) = mpsc::unbounded_channel();
         self.state.lock().unwrap().order_senders.push(sender);
         Box::pin(async move {
             Ok(Box::pin(UnboundedReceiverStream::new(receiver))
-                as EventStream<ReceivedOrderUpdate>)
+                as EventStream<ReceivedPrivateEvent>)
         })
     }
 }

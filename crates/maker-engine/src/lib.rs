@@ -10,9 +10,11 @@ mod config;
 mod engine;
 mod error;
 mod registry;
+mod reporting;
 mod storage;
 
 pub use config::{EngineConfig, EngineConfigError};
 pub use engine::{EnginePhase, MakerEngine};
 pub use error::EngineError;
 pub use registry::{OrderRegistry, RegisteredOrder, RegistryError, RegistryState};
+pub use reporting::{AccountSnapshotStage, EngineReport};

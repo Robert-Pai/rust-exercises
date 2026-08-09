@@ -4,7 +4,8 @@ use futures_util::{SinkExt, StreamExt};
 use maker_domain::{BestBidAsk, InstrumentSpec, Symbol};
 use maker_ports::{
     EventStream, ExchangeError, ExchangeErrorKind, ExchangeResult, LatestBboPublisher,
-    LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription, ReceivedOrderUpdate,
+    LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription, PrivateEvent,
+    ReceivedPrivateEvent,
 };
 use maker_runtime::{EventSource, RuntimeTelemetry, unix_time_ms};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -53,7 +54,7 @@ pub(crate) async fn subscribe_order_updates(
     idle_timeout: Duration,
     keepalive_interval: Duration,
     telemetry: Option<RuntimeTelemetry>,
-) -> ExchangeResult<EventStream<ReceivedOrderUpdate>> {
+) -> ExchangeResult<EventStream<ReceivedPrivateEvent>> {
     let listen_key = rest.create_listen_key().await?;
     let endpoint = stream_endpoint(websocket_url, &listen_key);
     let socket = connect(&endpoint, connect_timeout).await?;
@@ -69,7 +70,7 @@ pub(crate) async fn subscribe_order_updates(
         keepalive_interval,
         telemetry,
     ));
-    Ok(Box::pin(receiver) as EventStream<ReceivedOrderUpdate>)
+    Ok(Box::pin(receiver) as EventStream<ReceivedPrivateEvent>)
 }
 
 async fn run_book_ticker(
@@ -190,6 +191,36 @@ async fn run_order_updates(
                             }
                         };
                         match event {
+                            PrivateEventDto::AccountUpdate {
+                                event_time,
+                                transaction_time,
+                                account,
+                            } => {
+                                observe_private_event(
+                                    telemetry.as_ref(),
+                                    received_ns,
+                                    received_unix_ms,
+                                    event_time,
+                                    transaction_time,
+                                );
+                                let update = match mapping::websocket_account_update(
+                                    event_time,
+                                    transaction_time,
+                                    account,
+                                ) {
+                                    Ok(update) => update,
+                                    Err(error) => break error,
+                                };
+                                if let Err(error) = sender.publish_event(
+                                    PrivateEvent::AccountUpdate(update),
+                                    received_ns,
+                                ) {
+                                    if sender.is_closed() {
+                                        return;
+                                    }
+                                    break error;
+                                }
+                            }
                             PrivateEventDto::OrderTradeUpdate {
                                 event_time,
                                 transaction_time,
@@ -201,21 +232,64 @@ async fn run_order_updates(
                                 if !is_owned_target_limit_order(&target_symbol, &order) {
                                     continue;
                                 }
-                                if let Some(telemetry) = &telemetry {
-                                    telemetry.observe_exchange_event(
-                                        EventSource::PrivateData,
-                                        received_ns,
-                                        received_unix_ms,
-                                        event_time,
-                                        transaction_time,
-                                    );
-                                }
-                                let update = match mapping::websocket_order(&spec, order) {
+                                observe_private_event(
+                                    telemetry.as_ref(),
+                                    received_ns,
+                                    received_unix_ms,
+                                    event_time,
+                                    transaction_time,
+                                );
+                                let update = match mapping::websocket_order(&spec, &order) {
                                     Ok(Some(update)) => update,
                                     Ok(None) => continue,
                                     Err(error) => break error,
                                 };
-                                if let Err(error) = sender.publish_received(update, received_ns) {
+                                let trade = match mapping::websocket_order_trade(
+                                    update,
+                                    event_time,
+                                    transaction_time,
+                                    &order,
+                                ) {
+                                    Ok(trade) => trade,
+                                    Err(error) => break error,
+                                };
+                                if let Err(error) = sender.publish_event(
+                                    PrivateEvent::OrderUpdate { update, trade },
+                                    received_ns,
+                                ) {
+                                    if sender.is_closed() {
+                                        return;
+                                    }
+                                    break error;
+                                }
+                            }
+                            PrivateEventDto::TradeLite {
+                                event_time,
+                                transaction_time,
+                                trade,
+                            } => {
+                                if !is_owned_target_trade_lite(&target_symbol, &trade) {
+                                    continue;
+                                }
+                                observe_private_event(
+                                    telemetry.as_ref(),
+                                    received_ns,
+                                    received_unix_ms,
+                                    event_time,
+                                    transaction_time,
+                                );
+                                let trade = match mapping::websocket_trade_lite(
+                                    event_time,
+                                    transaction_time,
+                                    &trade,
+                                ) {
+                                    Ok(trade) => trade,
+                                    Err(error) => break error,
+                                };
+                                if let Err(error) = sender.publish_event(
+                                    PrivateEvent::TradeLite(trade),
+                                    received_ns,
+                                ) {
                                     if sender.is_closed() {
                                         return;
                                     }
@@ -293,6 +367,31 @@ fn is_owned_target_limit_order(
         && order.client_order_id.parse::<u64>().is_ok()
 }
 
+fn is_owned_target_trade_lite(
+    target_symbol: &Symbol,
+    trade: &crate::models::TradeLiteEventDto<'_>,
+) -> bool {
+    trade.symbol == target_symbol.as_str() && trade.client_order_id.parse::<u64>().is_ok()
+}
+
+fn observe_private_event(
+    telemetry: Option<&RuntimeTelemetry>,
+    received_ns: u64,
+    received_unix_ms: i64,
+    event_time: u64,
+    transaction_time: u64,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry.observe_exchange_event(
+            EventSource::PrivateData,
+            received_ns,
+            received_unix_ms,
+            event_time,
+            transaction_time,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +406,17 @@ mod tests {
             order_type,
             price: "1",
             original_quantity: "1",
+            average_price: "0",
+            execution_type: "NEW",
             cumulative_filled: "0",
+            last_filled_price: "0",
+            last_filled_quantity: "0",
+            commission_asset: None,
+            commission: None,
+            trade_time: 1,
+            trade_id: 0,
+            maker: false,
+            realized_pnl: "0",
             status: "NEW",
         }
     }

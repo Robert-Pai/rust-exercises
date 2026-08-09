@@ -109,6 +109,12 @@ impl RequestCost {
         orders: 1,
     };
 
+    pub(crate) const ACCOUNT_QUERY: Self = Self {
+        raw_requests: 1,
+        request_weight: 5,
+        orders: 0,
+    };
+
     const fn for_kind(self, kind: RateLimitType) -> u64 {
         match kind {
             RateLimitType::RawRequests => self.raw_requests,

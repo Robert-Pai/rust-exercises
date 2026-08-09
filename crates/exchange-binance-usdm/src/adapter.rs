@@ -10,9 +10,9 @@ use crate::{
 };
 use maker_domain::{BestBidAsk, ClientOrderId, InstrumentSpec, OrderIntent, OrderUpdate, Symbol};
 use maker_ports::{
-    CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind, ExchangeFuture, ExchangeResult,
-    InstrumentPort, LatestBboSubscription, MarketDataPort, OrderEventPort, PlaceOrderAck,
-    PositionMode, ReceivedOrderUpdate, TradingPort,
+    AccountPort, AccountSnapshot, CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind,
+    ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboSubscription, MarketDataPort,
+    OrderEventPort, PlaceOrderAck, PositionMode, ReceivedPrivateEvent, TradingPort,
 };
 use maker_runtime::RuntimeTelemetry;
 
@@ -184,11 +184,23 @@ impl TradingPort for BinanceUsdm {
     }
 }
 
+impl AccountPort for BinanceUsdm {
+    fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot> {
+        let balances = self.trading.account_balance_v2();
+        let status = self.trading.account_status_v2();
+        Box::pin(async move {
+            let balances = balances.await?;
+            let status = status.await?;
+            mapping::account_snapshot(balances, status)
+        })
+    }
+}
+
 impl OrderEventPort for BinanceUsdm {
     fn subscribe_order_updates(
         &mut self,
         symbol: Symbol,
-    ) -> ExchangeFuture<EventStream<ReceivedOrderUpdate>> {
+    ) -> ExchangeFuture<EventStream<ReceivedPrivateEvent>> {
         let spec = self.cached_instrument_spec(&symbol);
         let rest = self.rest.clone();
         let websocket_url = self.websocket_url.clone();
