@@ -182,6 +182,25 @@ impl RestClient {
         Ok(())
     }
 
+    /// Explicitly closes the server-side user-data stream so a subsequent
+    /// create request cannot reuse this process's previous listen key.
+    pub(crate) async fn close_listen_key(&self, listen_key: &str) -> ExchangeResult<()> {
+        if listen_key.is_empty() {
+            return Err(ExchangeError::new(
+                ExchangeErrorKind::InvalidRequest,
+                "Binance listen key cannot be empty",
+            ));
+        }
+        let _: serde_json::Value = self
+            .api_key_json(
+                Method::DELETE,
+                "/fapi/v1/listenKey",
+                vec![("listenKey".to_owned(), listen_key.to_owned())],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn public_json<T>(
         &self,
         method: Method,
@@ -539,12 +558,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_and_keeps_alive_futures_listen_key_with_query_parameter() {
+    async fn creates_keeps_alive_and_closes_futures_listen_key() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (sender, mut receiver) = mpsc::channel(2);
+        let (sender, mut receiver) = mpsc::channel(3);
         let server = tokio::spawn(async move {
-            for response_body in [r#"{"listenKey":"opaque-listen-key"}"#, r#"{}"#] {
+            for response_body in [r#"{"listenKey":"opaque-listen-key"}"#, r#"{}"#, r#"{}"#] {
                 let (mut connection, _) = listener.accept().await.unwrap();
                 let request = read_http_request(&mut connection).await;
                 sender.send(request).await.unwrap();
@@ -581,9 +600,11 @@ mod tests {
             .keepalive_listen_key("opaque-listen-key")
             .await
             .unwrap();
+        client.close_listen_key("opaque-listen-key").await.unwrap();
 
         let create_request = receiver.recv().await.unwrap();
         let keepalive_request = receiver.recv().await.unwrap();
+        let close_request = receiver.recv().await.unwrap();
         server.await.unwrap();
         assert!(create_request.starts_with("POST /fapi/v1/listenKey HTTP/1.1\r\n"));
         assert!(
@@ -592,6 +613,15 @@ mod tests {
         );
         assert!(
             keepalive_request
+                .to_ascii_lowercase()
+                .contains("\r\nx-mbx-apikey: test-key\r\n")
+        );
+        assert!(
+            close_request
+                .starts_with("DELETE /fapi/v1/listenKey?listenKey=opaque-listen-key HTTP/1.1\r\n")
+        );
+        assert!(
+            close_request
                 .to_ascii_lowercase()
                 .contains("\r\nx-mbx-apikey: test-key\r\n")
         );

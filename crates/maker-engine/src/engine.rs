@@ -142,10 +142,9 @@ impl MakerEngine {
         self.exchange
             .start()
             .map_err(|error| EngineError::exchange("start exchange session", error))?;
-        self.publish_account_snapshot(AccountSnapshotStage::Startup)
-            .await;
         let result = self.run_started(shutdown).await;
-        self.publish_account_snapshot(AccountSnapshotStage::Shutdown)
+        let _ = self
+            .load_account_snapshot(AccountSnapshotStage::Shutdown)
             .await;
         result
     }
@@ -285,6 +284,7 @@ impl MakerEngine {
             .subscribe_order_updates(*self.config.symbol())
             .await
             .map_err(|error| EngineError::exchange("subscribe order updates", error))?;
+
         let book = self
             .exchange
             .best_bid_ask(*self.config.symbol())
@@ -301,6 +301,17 @@ impl MakerEngine {
                 "best-bid/ask subscription did not expose its initial snapshot".to_owned(),
             )
         })?;
+
+        // Both private and market-data readers are now connected and running.
+        // Only after that stream-readiness barrier do we load the initial
+        // account view. Balances and positions must be confirmed before cancel,
+        // grid initialization, Running, and the first quote submission.
+        let account_stage = if self.phase == EnginePhase::Starting {
+            AccountSnapshotStage::Startup
+        } else {
+            AccountSnapshotStage::Recovery
+        };
+        self.load_account_snapshot(account_stage).await?;
 
         let cancel_stage = if self.phase == EnginePhase::Starting {
             CancelAllStage::Startup
@@ -506,12 +517,18 @@ impl MakerEngine {
         }
     }
 
-    async fn publish_account_snapshot(&mut self, stage: AccountSnapshotStage) {
-        if self.reporter.is_none() {
-            return;
-        }
+    async fn load_account_snapshot(
+        &mut self,
+        stage: AccountSnapshotStage,
+    ) -> Result<(), EngineError> {
         let result = self.exchange.account_snapshot().await;
-        self.publish_report(EngineReport::AccountSnapshot { stage, result });
+        self.publish_report(EngineReport::AccountSnapshot {
+            stage,
+            result: result.clone(),
+        });
+        result
+            .map(|_| ())
+            .map_err(|error| EngineError::exchange("load account snapshot", error))
     }
 
     fn publish_report(&mut self, report: EngineReport) {

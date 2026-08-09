@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use maker_domain::{BestBidAsk, InstrumentSpec, Symbol};
@@ -8,6 +12,7 @@ use maker_ports::{
     ReceivedPrivateEvent,
 };
 use maker_runtime::{EventSource, RuntimeTelemetry, unix_time_us};
+use tokio::sync::oneshot;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{
@@ -19,6 +24,8 @@ use crate::{
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const EVENT_BUFFER: usize = 256;
+const PRIVATE_EVENTS: &str = "ORDER_TRADE_UPDATE/ACCOUNT_UPDATE/TRADE_LITE/listenKeyExpired";
+const PRIVATE_STREAM_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) async fn subscribe_book_ticker(
     websocket_url: &str,
@@ -33,6 +40,7 @@ pub(crate) async fn subscribe_book_ticker(
     let endpoint = stream_endpoint(websocket_url, &stream_name);
     let (publisher, subscription) = LatestBboSubscription::channel(initial);
     let socket = connect(&endpoint, connect_timeout).await?;
+    let (ready_sender, ready_receiver) = oneshot::channel();
     tokio::spawn(run_book_ticker(
         socket,
         publisher,
@@ -40,7 +48,14 @@ pub(crate) async fn subscribe_book_ticker(
         spec,
         idle_timeout,
         telemetry,
+        ready_sender,
     ));
+    wait_for_reader_ready(
+        ready_receiver,
+        connect_timeout,
+        "Binance bookTicker WebSocket reader",
+    )
+    .await?;
     Ok(subscription)
 }
 
@@ -57,13 +72,21 @@ pub(crate) async fn subscribe_order_updates(
 ) -> ExchangeResult<EventStream<ReceivedPrivateEvent>> {
     let listen_key = rest.create_listen_key().await?;
     let endpoint = private_stream_endpoint(websocket_url, &listen_key);
-    let socket = connect(&endpoint, connect_timeout).await?;
+    let socket = match connect(&endpoint, connect_timeout).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            close_listen_key_with_log(&rest, &target_symbol, &listen_key, "connect failure").await;
+            return Err(error);
+        }
+    };
     tracing::info!(
         symbol = %target_symbol,
+        listen_key_fingerprint = %listen_key_fingerprint(&listen_key),
         endpoint = %private_stream_endpoint(websocket_url, "<redacted>"),
         "Binance private user-data WebSocket connected"
     );
     let (sender, receiver) = OrderUpdateSubscription::channel(EVENT_BUFFER);
+    let (ready_sender, ready_receiver) = oneshot::channel();
     tokio::spawn(run_order_updates(
         socket,
         sender,
@@ -74,7 +97,18 @@ pub(crate) async fn subscribe_order_updates(
         idle_timeout,
         keepalive_interval,
         telemetry,
+        ready_sender,
     ));
+    wait_for_reader_ready(
+        ready_receiver,
+        connect_timeout,
+        "Binance private user-data WebSocket reader",
+    )
+    .await?;
+    // This URL-bound stream has no application-level subscription
+    // acknowledgement. Give Binance's listen-key routing a short one-time
+    // settling window before bootstrap can place its first order.
+    tokio::time::sleep(PRIVATE_STREAM_SETTLE_DELAY).await;
     Ok(Box::pin(receiver) as EventStream<ReceivedPrivateEvent>)
 }
 
@@ -85,7 +119,12 @@ async fn run_book_ticker(
     spec: InstrumentSpec,
     idle_timeout: Duration,
     telemetry: Option<RuntimeTelemetry>,
+    ready: oneshot::Sender<()>,
 ) {
+    // There is no application-level subscription acknowledgement for a
+    // URL-bound stream. Signal readiness only from the spawned reader task;
+    // after this synchronous send it immediately polls socket.next() below.
+    let _ = ready.send(());
     let terminal_error = loop {
         let message = tokio::select! {
             _ = publisher.closed() => {
@@ -162,17 +201,30 @@ async fn run_order_updates(
     idle_timeout: Duration,
     keepalive_interval: Duration,
     telemetry: Option<RuntimeTelemetry>,
+    ready: oneshot::Sender<()>,
 ) {
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await;
     let idle = tokio::time::sleep(idle_timeout);
     tokio::pin!(idle);
+    let mut received_text_frame = false;
+
+    // The WebSocket upgrade has completed before this task is spawned. This
+    // barrier additionally proves that the private reader itself is running
+    // before bootstrap can continue toward its first order placement.
+    let _ = ready.send(());
 
     let terminal_error = loop {
         tokio::select! {
             _ = sender.closed() => {
                 let _ = socket.close(None).await;
+                close_listen_key_with_log(
+                    &rest,
+                    &target_symbol,
+                    &listen_key,
+                    "subscription closed",
+                ).await;
                 return;
             }
             message = socket.next() => {
@@ -185,6 +237,13 @@ async fn run_order_updates(
                 };
                 match message {
                     Ok(Message::Text(text)) => {
+                        if !received_text_frame {
+                            received_text_frame = true;
+                            tracing::info!(
+                                symbol = %target_symbol,
+                                "first Binance private user-data text frame received"
+                            );
+                        }
                         let received_ns = telemetry
                             .as_ref()
                             .map_or(0, RuntimeTelemetry::monotonic_time_ns);
@@ -237,12 +296,6 @@ async fn run_order_updates(
                                 transaction_time,
                                 order,
                             } => {
-                                // Binance user-data streams are account-wide. Ignore
-                                // other symbols before consulting the single-symbol
-                                // instrument cache used by this adapter.
-                                if !is_owned_target_limit_order(&target_symbol, &order) {
-                                    continue;
-                                }
                                 observe_private_event(
                                     telemetry.as_ref(),
                                     received_ns,
@@ -250,6 +303,24 @@ async fn run_order_updates(
                                     event_time,
                                     transaction_time,
                                 );
+                                // Binance user-data streams are account-wide. Ignore
+                                // other symbols before consulting the single-symbol
+                                // instrument cache used by this adapter.
+                                if !is_owned_target_order(&target_symbol, &order) {
+                                    tracing::warn!(
+                                        target_symbol = %target_symbol,
+                                        event_symbol = %order.symbol,
+                                        order_type = %order.order_type,
+                                        client_order_id = %order.client_order_id,
+                                        symbol_matches = order.symbol == target_symbol.as_str(),
+                                        numeric_client_order_id = order
+                                            .client_order_id
+                                            .parse::<u64>()
+                                            .is_ok(),
+                                        "ignored Binance private order update"
+                                    );
+                                    continue;
+                                }
                                 let update = match mapping::websocket_order(&spec, &order) {
                                     Ok(Some(update)) => update,
                                     Ok(None) => continue,
@@ -279,9 +350,6 @@ async fn run_order_updates(
                                 transaction_time,
                                 trade,
                             } => {
-                                if !is_owned_target_trade_lite(&target_symbol, &trade) {
-                                    continue;
-                                }
                                 observe_private_event(
                                     telemetry.as_ref(),
                                     received_ns,
@@ -289,6 +357,20 @@ async fn run_order_updates(
                                     event_time,
                                     transaction_time,
                                 );
+                                if !is_owned_target_trade_lite(&target_symbol, &trade) {
+                                    tracing::warn!(
+                                        target_symbol = %target_symbol,
+                                        event_symbol = %trade.symbol,
+                                        client_order_id = %trade.client_order_id,
+                                        symbol_matches = trade.symbol == target_symbol.as_str(),
+                                        numeric_client_order_id = trade
+                                            .client_order_id
+                                            .parse::<u64>()
+                                            .is_ok(),
+                                        "ignored Binance private trade-lite update"
+                                    );
+                                    continue;
+                                }
                                 let trade = match mapping::websocket_trade_lite(
                                     event_time,
                                     transaction_time,
@@ -362,7 +444,38 @@ async fn run_order_updates(
             }
         }
     };
+    close_listen_key_with_log(&rest, &target_symbol, &listen_key, "private reader stopped").await;
     sender.fail(terminal_error);
+}
+
+async fn close_listen_key_with_log(
+    rest: &RestClient,
+    symbol: &Symbol,
+    listen_key: &str,
+    reason: &'static str,
+) {
+    let fingerprint = listen_key_fingerprint(listen_key);
+    match rest.close_listen_key(listen_key).await {
+        Ok(()) => tracing::info!(
+            %symbol,
+            reason,
+            listen_key_fingerprint = %fingerprint,
+            "Binance listen key closed"
+        ),
+        Err(error) => tracing::error!(
+            %symbol,
+            reason,
+            listen_key_fingerprint = %fingerprint,
+            %error,
+            "failed to close Binance listen key"
+        ),
+    }
+}
+
+fn listen_key_fingerprint(listen_key: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    listen_key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 async fn connect(endpoint: &str, timeout: Duration) -> ExchangeResult<Socket> {
@@ -378,6 +491,27 @@ async fn connect(endpoint: &str, timeout: Duration) -> ExchangeResult<Socket> {
     Ok(connection.0)
 }
 
+async fn wait_for_reader_ready(
+    ready: oneshot::Receiver<()>,
+    timeout: Duration,
+    stream: &'static str,
+) -> ExchangeResult<()> {
+    tokio::time::timeout(timeout, ready)
+        .await
+        .map_err(|_| {
+            ExchangeError::new(
+                ExchangeErrorKind::Timeout,
+                format!("{stream} readiness timed out"),
+            )
+        })?
+        .map_err(|_| {
+            ExchangeError::new(
+                ExchangeErrorKind::ServiceUnavailable,
+                format!("{stream} stopped before becoming ready"),
+            )
+        })
+}
+
 fn stream_endpoint(base: &str, stream_name: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/ws") {
@@ -391,19 +525,17 @@ fn private_stream_endpoint(base: &str, listen_key: &str) -> String {
     let base = base.trim_end_matches('/');
     let base = base.strip_suffix("/ws").unwrap_or(base);
     if base.ends_with("/private") {
-        format!("{base}/ws?listenKey={listen_key}")
+        format!("{base}/ws?listenKey={listen_key}&events={PRIVATE_EVENTS}")
     } else {
-        format!("{base}/private/ws?listenKey={listen_key}")
+        format!("{base}/private/ws?listenKey={listen_key}&events={PRIVATE_EVENTS}")
     }
 }
 
-fn is_owned_target_limit_order(
+fn is_owned_target_order(
     target_symbol: &Symbol,
     order: &crate::models::OrderTradeEventDto<'_>,
 ) -> bool {
-    order.order_type == "LIMIT"
-        && order.symbol == target_symbol.as_str()
-        && order.client_order_id.parse::<u64>().is_ok()
+    order.symbol == target_symbol.as_str() && order.client_order_id.parse::<u64>().is_ok()
 }
 
 fn is_owned_target_trade_lite(
@@ -483,7 +615,10 @@ mod tests {
         ] {
             assert_eq!(
                 private_stream_endpoint(base, "listen-key"),
-                "wss://fstream.binance.com/private/ws?listenKey=listen-key"
+                concat!(
+                    "wss://fstream.binance.com/private/ws?listenKey=listen-key",
+                    "&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE/TRADE_LITE/listenKeyExpired"
+                )
             );
         }
     }
@@ -492,20 +627,11 @@ mod tests {
     fn filters_account_order_events_before_instrument_lookup() {
         let target = Symbol::new("BTCUSDT").unwrap();
 
-        assert!(!is_owned_target_limit_order(
-            &target,
-            &order("ETHUSDT", "LIMIT")
-        ));
-        assert!(!is_owned_target_limit_order(
-            &target,
-            &order("BTCUSDT", "MARKET")
-        ));
-        assert!(is_owned_target_limit_order(
-            &target,
-            &order("BTCUSDT", "LIMIT")
-        ));
+        assert!(!is_owned_target_order(&target, &order("ETHUSDT", "LIMIT")));
+        assert!(is_owned_target_order(&target, &order("BTCUSDT", "MARKET")));
+        assert!(is_owned_target_order(&target, &order("BTCUSDT", "LIMIT")));
         let mut external = order("BTCUSDT", "LIMIT");
         external.client_order_id = "manual-order";
-        assert!(!is_owned_target_limit_order(&target, &external));
+        assert!(!is_owned_target_order(&target, &external));
     }
 }

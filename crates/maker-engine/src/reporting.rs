@@ -8,6 +8,7 @@ use maker_ports::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountSnapshotStage {
     Startup,
+    Recovery,
     Shutdown,
 }
 
@@ -15,6 +16,7 @@ impl AccountSnapshotStage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Startup => "startup",
+            Self::Recovery => "recovery",
             Self::Shutdown => "shutdown",
         }
     }

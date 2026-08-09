@@ -30,6 +30,7 @@ enum Action {
     RefreshInstrument,
     PositionMode,
     SubscribeOrders,
+    AccountSnapshot,
     SubscribeBook,
     CancelAll,
     BestBook,
@@ -419,6 +420,7 @@ impl TradingPort for MockSession {
 
 impl AccountPort for MockSession {
     fn account_snapshot(&mut self) -> ExchangeFuture<AccountSnapshot> {
+        self.record(Action::AccountSnapshot);
         Box::pin(async {
             Ok(AccountSnapshot {
                 balances: Vec::new(),
@@ -535,7 +537,8 @@ async fn bootstraps_streams_before_cancel_and_places_both_sides() {
     assert!(matches!(actions[2], Action::SubscribeOrders));
     assert!(matches!(actions[3], Action::BestBook));
     assert!(matches!(actions[4], Action::SubscribeBook));
-    assert!(matches!(actions[5], Action::CancelAll));
+    assert!(matches!(actions[5], Action::AccountSnapshot));
+    assert!(matches!(actions[6], Action::CancelAll));
 
     let mut prices: Vec<_> = exchange
         .accepted_orders()
