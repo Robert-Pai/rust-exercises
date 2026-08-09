@@ -64,6 +64,7 @@ struct Command {
     mode: ResponseMode,
     clock_retried: bool,
     submitted_ns: u64,
+    dequeued_ns: u64,
     origin: Option<EventOrigin>,
     measure_dispatch: bool,
     deadline: tokio::time::Instant,
@@ -106,7 +107,7 @@ enum DispatchOutcome {
 
 #[derive(Debug, Deserialize)]
 struct WsApiResponse {
-    id: u64,
+    id: WsApiResponseId,
     status: u16,
     #[serde(default)]
     result: Option<Value>,
@@ -114,6 +115,24 @@ struct WsApiResponse {
     error: Option<ApiErrorDto>,
     #[serde(default, rename = "rateLimits")]
     rate_limits: Vec<RateLimitDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WsApiResponseId {
+    Integer(i64),
+    String(String),
+    Null(()),
+}
+
+impl WsApiResponseId {
+    fn transport_id(&self) -> Option<u64> {
+        match self {
+            Self::Integer(id) => u64::try_from(*id).ok(),
+            Self::String(id) => id.parse().ok(),
+            Self::Null(()) => None,
+        }
+    }
 }
 
 impl WsApiClient {
@@ -262,6 +281,7 @@ impl WsApiClient {
             mode,
             clock_retried: false,
             submitted_ns,
+            dequeued_ns: 0,
             origin,
             measure_dispatch: true,
             deadline: tokio::time::Instant::now() + self.queue_timeout,
@@ -312,9 +332,13 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
 
     loop {
         if socket.is_none() {
-            let Some(command) = commands.recv().await else {
+            let Some(mut command) = commands.recv().await else {
                 return;
             };
+            command.dequeued_ns = config
+                .telemetry
+                .as_ref()
+                .map_or(0, RuntimeTelemetry::monotonic_time_ns);
             if command_is_inactive(&command) {
                 finish_inactive(command);
                 continue;
@@ -365,7 +389,7 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
         let retry_at = next_deferred_retry(&deferred);
         tokio::select! {
             command = commands.recv(), if active_count(&pending, &deferred) < TRANSPORT_ID_SLOTS => {
-                let Some(command) = command else {
+                let Some(mut command) = command else {
                     fail_worker(
                         &mut pending,
                         &mut deferred,
@@ -376,6 +400,10 @@ async fn run_worker(config: WorkerConfig, mut commands: SpscConsumer<Command>) {
                     );
                     return;
                 };
+                command.dequeued_ns = config
+                    .telemetry
+                    .as_ref()
+                    .map_or(0, RuntimeTelemetry::monotonic_time_ns);
                 if command_is_inactive(&command) {
                     finish_inactive(command);
                     continue;
@@ -548,6 +576,10 @@ async fn dispatch(
         queue_deadline,
         tokio::time::Instant::now() + config.response_timeout,
     );
+    let prepare_started_ns = config
+        .telemetry
+        .as_ref()
+        .map_or(0, RuntimeTelemetry::monotonic_time_ns);
 
     let id = next_transport_id(next_request_id);
     let slot = transport_slot(id);
@@ -563,6 +595,7 @@ async fn dispatch(
     let mode = command.mode;
     let method = command.method;
     let submitted_ns = command.submitted_ns;
+    let dequeued_ns = command.dequeued_ns;
     let origin = command.origin;
     let measure_dispatch = command.measure_dispatch;
     let recovery_parameters = command.parameters.clone();
@@ -592,7 +625,7 @@ async fn dispatch(
         json!(sign_payload(&payload, config.credentials.signing_key())),
     );
     let payload = match serde_json::to_string(&json!({
-        "id": id,
+        "id": id.to_string(),
         "method": command.method,
         "params": signed,
     })) {
@@ -619,6 +652,10 @@ async fn dispatch(
     let Some(send_timeout) = remaining(deadline) else {
         return DispatchOutcome::Reset(response_timeout_error());
     };
+    let send_started_ns = config
+        .telemetry
+        .as_ref()
+        .map_or(0, RuntimeTelemetry::monotonic_time_ns);
     match tokio::time::timeout(send_timeout, socket.send(Message::Text(payload.into()))).await {
         Ok(Ok(())) => {
             if measure_dispatch {
@@ -626,6 +663,9 @@ async fn dispatch(
                     telemetry.observe_request_sent(
                         origin,
                         submitted_ns,
+                        dequeued_ns,
+                        prepare_started_ns,
+                        send_started_ns,
                         telemetry.monotonic_time_ns(),
                     );
                 }
@@ -664,7 +704,12 @@ async fn handle_message(
             let response: WsApiResponse = match serde_json::from_str(text.as_ref()) {
                 Ok(response) => response,
                 Err(error) => {
-                    return Some(error::invalid_response("WebSocket API response", error));
+                    tracing::error!(
+                        error = %error,
+                        raw_response = %text,
+                        "failed to parse Binance WebSocket API response"
+                    );
+                    return None;
                 }
             };
             let snapshots = response
@@ -675,8 +720,8 @@ async fn handle_message(
                         &limit.rate_limit_type,
                         &limit.interval,
                         limit.interval_num,
-                        limit.limit,
-                        limit.count,
+                        limit.non_negative_limit(),
+                        limit.non_negative_count(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -690,7 +735,22 @@ async fn handle_message(
             {
                 return Some(error);
             }
-            let request = take_pending(pending, response.id)?;
+            let Some(response_id) = response.id.transport_id() else {
+                tracing::warn!(
+                    response_id = ?response.id,
+                    status = response.status,
+                    "Binance WebSocket API response has no matchable request ID"
+                );
+                return None;
+            };
+            let Some(request) = take_pending(pending, response_id) else {
+                tracing::warn!(
+                    response_id,
+                    status = response.status,
+                    "Binance WebSocket API response does not match a pending request"
+                );
+                return None;
+            };
             if request.reply.is_closed() {
                 return None;
             }
@@ -734,6 +794,7 @@ async fn handle_message(
                     mode: request.mode,
                     clock_retried: true,
                     submitted_ns: request.submitted_ns,
+                    dequeued_ns: 0,
                     origin: request.origin,
                     measure_dispatch: false,
                     deadline: request.deadline,
@@ -766,6 +827,7 @@ async fn handle_message(
                     mode: ResponseMode::CancelQuery,
                     clock_retried: request.clock_retried,
                     submitted_ns: request.submitted_ns,
+                    dequeued_ns: 0,
                     origin: request.origin,
                     measure_dispatch: false,
                     deadline: request.deadline,

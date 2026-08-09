@@ -85,8 +85,8 @@ impl RestClient {
                     &limit.rate_limit_type,
                     &limit.interval,
                     limit.interval_num,
-                    limit.limit,
-                    limit.count,
+                    limit.non_negative_limit(),
+                    limit.non_negative_count(),
                 )
             })
             .collect::<Vec<_>>();

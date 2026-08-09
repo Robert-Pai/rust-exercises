@@ -48,5 +48,5 @@ retention_days = 14
 stdout = false
 # Lock-free counters are aggregated on hot threads and logged by the CLI at
 # this interval. Local reaction/send latency is reported in nanoseconds;
-# exchange timestamp delay is reported in milliseconds.
+# exchange timestamp delay is reported in microseconds.
 telemetry_interval_secs = 10

@@ -8,14 +8,14 @@ use maker_domain::{
     BestBidAsk, ClientOrderId, ExchangeOrderId, FilledLots, InstrumentSpec, MarketKind,
     OrderIntent, OrderStatus, OrderUpdate, PriceTicks, Side, Symbol,
 };
-use maker_engine::{EngineConfig, MakerEngine};
+use maker_engine::{EngineConfig, EngineReport, MakerEngine};
 use maker_ports::{
     AccountPort, AccountSnapshot, CancelOutcome, EventStream, ExchangeError, ExchangeErrorKind,
     ExchangeFuture, ExchangeResult, InstrumentPort, LatestBboPublisher, LatestBboSubscription,
     MarketDataPort, OrderEventPort, PlaceOrderAck, PositionMode, ReceivedOrderUpdate,
     ReceivedPrivateEvent, TradingPort,
 };
-use maker_runtime::{EventOrigin, EventSource, current_event_origin};
+use maker_runtime::{EventOrigin, EventSource, current_event_origin, spsc_channel};
 use rust_decimal::Decimal;
 use tokio::{
     sync::{Notify, Semaphore, mpsc, oneshot},
@@ -832,6 +832,60 @@ async fn retries_failed_placement_on_reconcile_timer() {
     );
 
     stop_engine(shutdown, task).await;
+}
+
+#[tokio::test]
+async fn reports_failed_placement_with_exchange_context() {
+    let exchange = MockExchange::new();
+    exchange.fail_next_placement();
+    let (reports, mut report_receiver) = spsc_channel(16);
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let exchange_port: Box<dyn maker_ports::Exchange> = Box::new(MockSession(exchange.clone()));
+    let mut engine = MakerEngine::new(config(), exchange_port).with_reporter(reports);
+    let task = tokio::spawn(async move {
+        engine
+            .run(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    assert!(matches!(
+        report_receiver.recv().await,
+        Some(EngineReport::AccountSnapshot { .. })
+    ));
+    assert!(matches!(
+        report_receiver.recv().await,
+        Some(EngineReport::CancelAllStarted { .. })
+    ));
+    assert!(matches!(
+        report_receiver.recv().await,
+        Some(EngineReport::CancelAllFinished { result: Ok(()), .. })
+    ));
+    let failure = report_receiver.recv().await.unwrap();
+    match failure {
+        EngineReport::ExchangeFailure {
+            operation,
+            symbol,
+            client_order_id,
+            side,
+            price_ticks,
+            quantity_lots,
+            error,
+        } => {
+            assert_eq!(operation, "place post-only order");
+            assert_eq!(symbol, Symbol::new("BTCUSDT").unwrap());
+            assert!(client_order_id.is_some());
+            assert!(side.is_some());
+            assert!(price_ticks.is_some());
+            assert!(quantity_lots.is_some());
+            assert_eq!(error.kind(), ExchangeErrorKind::Network);
+            assert_eq!(error.message(), "injected placement failure");
+        }
+        other => panic!("expected placement failure report, got {other:?}"),
+    }
+
+    stop_engine(shutdown_sender, task).await;
 }
 
 #[tokio::test]

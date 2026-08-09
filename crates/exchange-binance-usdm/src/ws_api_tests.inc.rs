@@ -50,6 +50,123 @@ fn parses_websocket_rate_limit_telemetry() {
 }
 
 #[test]
+fn parses_all_documented_websocket_response_id_types() {
+    for (id, expected) in [
+        (json!(7), Some(7)),
+        (json!("8"), Some(8)),
+        (Value::Null, None),
+        (json!(-1), None),
+        (json!("arbitrary-id"), None),
+    ] {
+        let response: WsApiResponse = serde_json::from_value(json!({
+            "id": id,
+            "status": 200,
+            "result": {}
+        }))
+        .unwrap();
+
+        assert_eq!(response.id.transport_id(), expected);
+    }
+}
+
+#[test]
+fn parses_negative_websocket_rate_limit_values_as_unavailable() {
+    let response: WsApiResponse = serde_json::from_str(
+        r#"{
+            "id": 1,
+            "status": 200,
+            "rateLimits": [{
+                "rateLimitType": "ORDERS",
+                "interval": "SECOND",
+                "intervalNum": 10,
+                "limit": -1,
+                "count": -1
+            }],
+            "result": {}
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(response.rate_limits.len(), 1);
+    assert_eq!(response.rate_limits[0].limit, -1);
+    assert_eq!(response.rate_limits[0].count, Some(-1));
+    assert_eq!(response.rate_limits[0].non_negative_limit(), None);
+    assert_eq!(response.rate_limits[0].non_negative_count(), None);
+}
+
+#[tokio::test]
+async fn unavailable_rate_limit_values_do_not_drop_successful_response() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_address = http_listener.local_addr().unwrap();
+    let http_server = tokio::spawn(serve_time_once(http_listener));
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_address = ws_listener.local_addr().unwrap();
+    let ws_server = tokio::spawn(async move {
+        let (connection, _) = ws_listener.accept().await.unwrap();
+        let mut socket = accept_async(connection).await.unwrap();
+        let Message::Text(request) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected order request");
+        };
+        let request: Value = serde_json::from_str(request.as_ref()).unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": request["id"],
+                    "status": 200,
+                    "result": order_result("NEW", "0.000"),
+                    "rateLimits": [
+                        {
+                            "rateLimitType": "REQUEST_WEIGHT",
+                            "interval": "MINUTE",
+                            "intervalNum": 1,
+                            "limit": -1,
+                            "count": -1
+                        },
+                        {
+                            "rateLimitType": "ORDERS",
+                            "interval": "SECOND",
+                            "intervalNum": 10,
+                            "limit": 300,
+                            "count": 1
+                        },
+                        {
+                            "rateLimitType": "ORDERS",
+                            "interval": "MINUTE",
+                            "intervalNum": 1,
+                            "limit": 1200,
+                            "count": 1
+                        }
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let config = test_config(http_address, ws_address, Duration::from_millis(250));
+    let credentials = test_credentials();
+    let rest = RestClient::new(&config, credentials.clone()).unwrap();
+    let mut network = NetworkRuntime::new(crate::network::NetworkRole::Trading, &config).unwrap();
+    let mut client = WsApiClient::new(&config, credentials, rest, &mut network).unwrap();
+    let intent = OrderIntent::post_only(
+        Symbol::new("BTCUSDT").unwrap(),
+        ClientOrderId::new(1).unwrap(),
+        Side::Buy,
+        PriceTicks::new(640_001).unwrap(),
+        QuantityLots::new(1).unwrap(),
+    );
+
+    let ack = client.place_order(&test_spec(), &intent).await.unwrap();
+    assert_eq!(ack.order_id, 42);
+
+    http_server.await.unwrap();
+    ws_server.await.unwrap();
+}
+
+#[test]
 fn signature_payload_rejects_nested_values() {
     let parameters = Parameters::from([("bad".to_owned(), json!({"nested": true}))]);
 
@@ -174,6 +291,7 @@ fn closed_and_expired_queued_commands_are_inactive() {
         mode: ResponseMode::Direct,
         clock_retried: false,
         submitted_ns: 1,
+        dequeued_ns: 0,
         origin: None,
         measure_dispatch: true,
         deadline: tokio::time::Instant::now() + Duration::from_secs(1),
@@ -188,6 +306,7 @@ fn closed_and_expired_queued_commands_are_inactive() {
         mode: ResponseMode::Direct,
         clock_retried: false,
         submitted_ns: 1,
+        dequeued_ns: 0,
         origin: None,
         measure_dispatch: true,
         deadline: tokio::time::Instant::now() - Duration::from_millis(1),
@@ -320,7 +439,7 @@ fn connection_reset_drains_every_fixed_slot() {
 }
 
 #[tokio::test]
-async fn worker_owns_response_timeout_and_reuses_connection_after_cleanup() {
+async fn malformed_response_times_out_request_and_reuses_connection() {
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_address = http_listener.local_addr().unwrap();
     let http_server = tokio::spawn(serve_time_once(http_listener));
@@ -334,6 +453,18 @@ async fn worker_owns_response_timeout_and_reuses_connection_after_cleanup() {
             panic!("expected first request");
         };
         let first: Value = serde_json::from_str(first.as_ref()).unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": first["id"],
+                    "status": "invalid-status",
+                    "result": {}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
         let Message::Text(second) = socket.next().await.unwrap().unwrap() else {
             panic!("expected second request");
         };
@@ -650,7 +781,7 @@ async fn sends_supported_order_mutations_over_one_signed_websocket_connection() 
             };
             let request: Value = serde_json::from_str(text.as_ref()).unwrap();
             assert_eq!(request["method"], method);
-            let id = request["id"].as_u64().unwrap();
+            let id = request["id"].as_str().unwrap();
             assert_valid_test_signature(&request["params"]);
 
             if method == "order.cancel" {

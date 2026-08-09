@@ -10,7 +10,7 @@ use maker_domain::{
     BestBidAsk, ClientOrderId, ExchangeOrderId, FilledLots, InstrumentSpec, MarketKind,
     OrderIntent, OrderStatus, OrderUpdate, PriceTicks, Side, Symbol,
 };
-use maker_engine::{AccountSnapshotStage, EngineConfig, EngineReport, MakerEngine};
+use maker_engine::{AccountSnapshotStage, CancelAllStage, EngineConfig, EngineReport, MakerEngine};
 use maker_ports::{
     AccountPort, AccountSnapshot, CancelOutcome, EventStream, ExchangeFuture, ExchangeResult,
     InstrumentPort, LatestBboPublisher, LatestBboSubscription, MarketDataPort, OrderEventPort,
@@ -501,7 +501,7 @@ async fn partial_fill_does_not_roll_the_grid() {
 async fn reports_account_snapshots_before_startup_and_after_shutdown() {
     let (exchange, _order_sender, _book_sender) = MockExchange::new();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let (reports, mut report_receiver) = spsc_channel(2);
+    let (reports, mut report_receiver) = spsc_channel(8);
     let mut engine = MakerEngine::new(engine_config(), Box::new(MockSession(exchange.clone())))
         .with_reporter(reports);
     let task = tokio::spawn(async move {
@@ -517,12 +517,46 @@ async fn reports_account_snapshots_before_startup_and_after_shutdown() {
     task.await.unwrap().unwrap();
 
     let startup = report_receiver.recv().await.unwrap();
+    let startup_cancel_started = report_receiver.recv().await.unwrap();
+    let startup_cancel_finished = report_receiver.recv().await.unwrap();
+    let shutdown_cancel_started = report_receiver.recv().await.unwrap();
+    let shutdown_cancel_finished = report_receiver.recv().await.unwrap();
     let shutdown = report_receiver.recv().await.unwrap();
     assert!(matches!(
         startup,
         EngineReport::AccountSnapshot {
             stage: AccountSnapshotStage::Startup,
             result: Ok(_),
+        }
+    ));
+    assert!(matches!(
+        startup_cancel_started,
+        EngineReport::CancelAllStarted {
+            stage: CancelAllStage::Startup,
+            ..
+        }
+    ));
+    assert!(matches!(
+        startup_cancel_finished,
+        EngineReport::CancelAllFinished {
+            stage: CancelAllStage::Startup,
+            result: Ok(()),
+            ..
+        }
+    ));
+    assert!(matches!(
+        shutdown_cancel_started,
+        EngineReport::CancelAllStarted {
+            stage: CancelAllStage::Shutdown,
+            ..
+        }
+    ));
+    assert!(matches!(
+        shutdown_cancel_finished,
+        EngineReport::CancelAllFinished {
+            stage: CancelAllStage::Shutdown,
+            result: Ok(()),
+            ..
         }
     ));
     assert!(matches!(

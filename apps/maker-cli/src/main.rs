@@ -143,6 +143,40 @@ fn log_engine_report(report: EngineReport) {
                 );
             }
         },
+        EngineReport::CancelAllStarted { stage, symbol } => {
+            info!(
+                stage = stage.as_str(),
+                %symbol,
+                "Binance cancel-all started"
+            );
+        }
+        EngineReport::CancelAllFinished {
+            stage,
+            symbol,
+            duration_us,
+            result,
+        } => match result {
+            Ok(()) => {
+                info!(
+                    stage = stage.as_str(),
+                    %symbol,
+                    duration_us,
+                    "Binance cancel-all succeeded"
+                );
+            }
+            Err(exchange_error) => {
+                error!(
+                    stage = stage.as_str(),
+                    %symbol,
+                    duration_us,
+                    error_kind = %exchange_error.kind(),
+                    exchange_code = ?exchange_error.exchange_code(),
+                    retry_after_ms = ?exchange_error.retry_after().map(|delay| delay.as_millis()),
+                    error_message = exchange_error.message(),
+                    "Binance cancel-all failed"
+                );
+            }
+        },
         EngineReport::AccountUpdate(update) => {
             info!(
                 event_time_ms = update.event_time_ms,
@@ -181,6 +215,20 @@ fn log_engine_report(report: EngineReport) {
                     "Binance position update"
                 );
             }
+        }
+        EngineReport::OrderUpdate(update) => {
+            info!(
+                event = "ORDER_TRADE_UPDATE",
+                symbol = %update.symbol(),
+                client_order_id = update.client_order_id().get(),
+                exchange_order_id = update.exchange_order_id().get(),
+                side = ?update.side(),
+                status = ?update.status(),
+                price_ticks = update.price().get(),
+                original_quantity_lots = update.original_quantity().get(),
+                cumulative_filled_lots = update.cumulative_filled().get(),
+                "Binance order update"
+            );
         }
         EngineReport::OrderTrade(trade) => {
             let update = trade.update;
@@ -223,6 +271,35 @@ fn log_engine_report(report: EngineReport) {
                 maker = trade.maker,
                 "Binance Trade Lite execution"
             );
+        }
+        EngineReport::ExchangeFailure {
+            operation,
+            symbol,
+            client_order_id,
+            side,
+            price_ticks,
+            quantity_lots,
+            error: exchange_error,
+        } => {
+            error!(
+                operation,
+                %symbol,
+                client_order_id = ?client_order_id.map(|id| id.get()),
+                ?side,
+                price_ticks = ?price_ticks.map(|price| price.get()),
+                quantity_lots = ?quantity_lots.map(|quantity| quantity.get()),
+                error_kind = %exchange_error.kind(),
+                exchange_code = ?exchange_error.exchange_code(),
+                retry_after_ms = ?exchange_error.retry_after().map(|delay| delay.as_millis()),
+                error_message = exchange_error.message(),
+                "Binance exchange operation failed"
+            );
+        }
+        EngineReport::EngineFailure {
+            operation,
+            error: failure,
+        } => {
+            error!(operation, error = %failure, "maker engine operation failed");
         }
     }
 }
@@ -269,19 +346,19 @@ fn log_telemetry_snapshot(snapshot: &TelemetrySnapshot, period: Duration) {
 
     log_signed_latency(
         "market_exchange_event_delay",
-        &snapshot.market_event_delay_ms,
+        &snapshot.market_event_delay_us,
     );
     log_signed_latency(
         "market_exchange_transaction_delay",
-        &snapshot.market_transaction_delay_ms,
+        &snapshot.market_transaction_delay_us,
     );
     log_signed_latency(
         "private_exchange_event_delay",
-        &snapshot.private_event_delay_ms,
+        &snapshot.private_event_delay_us,
     );
     log_signed_latency(
         "private_exchange_transaction_delay",
-        &snapshot.private_transaction_delay_ms,
+        &snapshot.private_transaction_delay_us,
     );
     log_latency(
         "market_strategy_reaction",
@@ -299,14 +376,22 @@ fn log_telemetry_snapshot(snapshot: &TelemetrySnapshot, period: Duration) {
         "background_request_dispatch_send",
         &snapshot.background_request_dispatch_ns,
     );
+    log_latency("request_queue_wait", &snapshot.request_queue_wait_ns);
+    log_latency(
+        "request_enqueue_to_dequeue",
+        &snapshot.request_enqueue_to_dequeue_ns,
+    );
+    log_latency(
+        "request_preflight_wait",
+        &snapshot.request_preflight_wait_ns,
+    );
+    log_latency("request_prepare", &snapshot.request_prepare_ns);
+    log_latency("socket_send", &snapshot.socket_send_ns);
     log_latency("market_receive_to_send", &snapshot.market_end_to_end_ns);
     log_latency("private_receive_to_send", &snapshot.private_end_to_end_ns);
 }
 
 fn log_latency(metric: &str, latency: &LatencySnapshot) {
-    if latency.samples == 0 {
-        return;
-    }
     info!(
         metric,
         unit = "ns",
@@ -320,12 +405,9 @@ fn log_latency(metric: &str, latency: &LatencySnapshot) {
 }
 
 fn log_signed_latency(metric: &str, latency: &SignedLatencySnapshot) {
-    if latency.samples == 0 {
-        return;
-    }
     info!(
         metric,
-        unit = "ms",
+        unit = "us",
         samples = latency.samples,
         mean = latency.mean,
         p50_upper = latency.p50_upper,

@@ -23,9 +23,19 @@ pub(crate) struct RateLimitDto {
     pub(crate) rate_limit_type: String,
     pub(crate) interval: String,
     pub(crate) interval_num: u64,
-    pub(crate) limit: u64,
+    pub(crate) limit: i64,
     #[serde(default)]
-    pub(crate) count: Option<u64>,
+    pub(crate) count: Option<i64>,
+}
+
+impl RateLimitDto {
+    pub(crate) fn non_negative_limit(&self) -> Option<u64> {
+        u64::try_from(self.limit).ok()
+    }
+
+    pub(crate) fn non_negative_count(&self) -> Option<u64> {
+        self.count.and_then(|count| u64::try_from(count).ok())
+    }
 }
 
 #[derive(Debug, Deserialize)]

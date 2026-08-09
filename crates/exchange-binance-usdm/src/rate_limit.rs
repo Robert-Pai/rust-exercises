@@ -54,7 +54,7 @@ impl RateLimitSnapshot {
         rate_limit_type: &str,
         interval: &str,
         interval_num: u64,
-        limit: u64,
+        limit: Option<u64>,
         count: Option<u64>,
     ) -> Option<Self> {
         let kind = match rate_limit_type {
@@ -74,7 +74,7 @@ impl RateLimitSnapshot {
         Some(Self {
             kind,
             interval,
-            limit: Some(limit),
+            limit,
             count: count.unwrap_or(0),
         })
     }

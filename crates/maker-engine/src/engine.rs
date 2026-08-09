@@ -2,7 +2,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -21,7 +21,9 @@ use maker_runtime::{
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use crate::storage::{FixedVec, IdMap, IdSet, LIFECYCLE_CAPACITY, MAX_GRID_LEVELS};
-use crate::{AccountSnapshotStage, EngineConfig, EngineError, EngineReport, OrderRegistry};
+use crate::{
+    AccountSnapshotStage, CancelAllStage, EngineConfig, EngineError, EngineReport, OrderRegistry,
+};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SESSION_MASK: u64 = u32::MAX as u64;
@@ -184,7 +186,12 @@ impl MakerEngine {
                                 telemetry.observe_recovery_started();
                             }
                             if let Err(error) = self.recover_stream_loss().await {
-                                let _ = self.cancel_all_for_recovery().await;
+                                if let Err(cancel_error) = self.cancel_all_for_recovery().await {
+                                    self.publish_engine_failure(
+                                        "cancel all after recovery failure",
+                                        &cancel_error,
+                                    );
+                                }
                                 return Err(error);
                             }
                             rebuild_grid = false;
@@ -205,6 +212,7 @@ impl MakerEngine {
                     }
                 }
                 Err(error) if error.recommends_recovery() => {
+                    self.publish_engine_failure("bootstrap maker session", &error);
                     first_attempt = false;
                     self.set_phase(EnginePhase::Recovering);
                     if let Some(telemetry) = &self.telemetry {
@@ -225,12 +233,18 @@ impl MakerEngine {
                         // stream failure; cancel-all alone would leave the
                         // local registry claiming canceled orders are live.
                         if let Err(recovery_error) = self.recover_stream_loss().await {
-                            let _ = self.cancel_all_for_recovery().await;
+                            if let Err(cancel_error) = self.cancel_all_for_recovery().await {
+                                self.publish_engine_failure(
+                                    "cancel all after recovery failure",
+                                    &cancel_error,
+                                );
+                            }
                             return Err(recovery_error);
                         }
                     }
                 }
                 Err(error) => {
+                    self.publish_engine_failure("bootstrap maker session", &error);
                     self.set_phase(EnginePhase::Stopping);
                     self.cancel_all_for_recovery().await?;
                     return Err(error);
@@ -288,10 +302,13 @@ impl MakerEngine {
             )
         })?;
 
-        self.exchange
-            .cancel_all(*self.config.symbol())
-            .await
-            .map_err(|error| EngineError::exchange("initial cancel all", error))?;
+        let cancel_stage = if self.phase == EnginePhase::Starting {
+            CancelAllStage::Startup
+        } else {
+            CancelAllStage::Recovery
+        };
+        self.cancel_all_with_report(cancel_stage, "initial cancel all")
+            .await?;
 
         if rebuild_grid {
             self.begin_session()?;
@@ -403,6 +420,7 @@ impl MakerEngine {
                             let received_ns = received.received_ns();
                             match received.into_event() {
                                 PrivateEvent::OrderUpdate { update, trade } => {
+                                    self.publish_report(EngineReport::OrderUpdate(update));
                                     if let Some(trade) = trade {
                                         self.publish_report(EngineReport::OrderTrade(trade));
                                     }
@@ -422,10 +440,20 @@ impl MakerEngine {
                                 }
                             }
                         }
-                        Some(Err(_)) => {
+                        Some(Err(error)) => {
+                            self.publish_exchange_failure(
+                                "private user-data stream",
+                                None,
+                                None,
+                                error,
+                            );
                             return DriveExit::Recover;
                         }
                         None => {
+                            self.publish_engine_failure(
+                                "private user-data stream",
+                                "stream ended without a terminal error",
+                            );
                             return DriveExit::Recover;
                         }
                     }
@@ -458,6 +486,7 @@ impl MakerEngine {
             };
 
             if let Err(error) = result {
+                self.publish_engine_failure("drive maker session", &error);
                 return Self::classify_error(error);
             }
             if let Err(error) = self.schedule_reconcile(&mut commands, origin) {
@@ -498,6 +527,35 @@ impl MakerEngine {
                 }
             }
         }
+    }
+
+    fn publish_exchange_failure(
+        &mut self,
+        operation: &'static str,
+        client_order_id: Option<ClientOrderId>,
+        level: Option<GridLevel>,
+        error: maker_ports::ExchangeError,
+    ) {
+        self.publish_report(EngineReport::ExchangeFailure {
+            operation,
+            symbol: *self.config.symbol(),
+            client_order_id,
+            side: level.map(GridLevel::side),
+            price_ticks: level.map(GridLevel::price),
+            quantity_lots: level.map(GridLevel::quantity),
+            error,
+        });
+    }
+
+    fn publish_engine_failure(
+        &mut self,
+        operation: &'static str,
+        error: &(impl std::fmt::Display + ?Sized),
+    ) {
+        self.publish_report(EngineReport::EngineFailure {
+            operation,
+            error: error.to_string(),
+        });
     }
 
     fn handle_order_update(&mut self, update: OrderUpdate) -> Result<(), EngineError> {
@@ -900,7 +958,13 @@ impl MakerEngine {
         self.instrument_refresh_inflight = false;
         let refreshed = match refreshed {
             Ok(refreshed) => refreshed,
-            Err(_) => {
+            Err(error) => {
+                self.publish_exchange_failure(
+                    "refresh instrument specification",
+                    None,
+                    None,
+                    error,
+                );
                 return Ok(());
             }
         };
@@ -932,8 +996,14 @@ impl MakerEngine {
         self.inflight_placements.remove(&client_order_id);
 
         if self.filled_before_ack.remove(&client_order_id) {
-            if let Ok(ack) = &result {
-                self.validate_ack(&client_order_id, ack)?;
+            match &result {
+                Ok(ack) => self.validate_ack(&client_order_id, ack)?,
+                Err(error) => self.publish_exchange_failure(
+                    "place post-only order after pre-ACK fill",
+                    Some(client_order_id),
+                    Some(level),
+                    error.clone(),
+                ),
             }
             self.placement_attempts.remove(&client_order_id);
             self.pre_ack_updates.remove(&client_order_id);
@@ -957,6 +1027,12 @@ impl MakerEngine {
                 self.drain_pending_fills()?;
             }
             Err(error) => {
+                self.publish_exchange_failure(
+                    "place post-only order",
+                    Some(client_order_id),
+                    Some(level),
+                    error.clone(),
+                );
                 let may_exist = placement_may_exist(error.kind())
                     || self.pre_ack_updates.contains_key(&client_order_id);
                 if may_exist {
@@ -1029,6 +1105,12 @@ impl MakerEngine {
                 } else {
                     "cancel order"
                 };
+                self.publish_exchange_failure(
+                    operation,
+                    Some(client_order_id),
+                    self.known_level(&client_order_id),
+                    error.clone(),
+                );
                 let engine_error = EngineError::exchange(operation, error);
                 if engine_error.exchange_is_fatal() {
                     return Err(engine_error);
@@ -1324,19 +1406,48 @@ impl MakerEngine {
     }
 
     async fn cancel_all_for_recovery(&mut self) -> Result<(), EngineError> {
-        match self.exchange.cancel_all(*self.config.symbol()).await {
-            Ok(()) => Ok(()),
-            Err(error) => Err(EngineError::exchange("cancel all during recovery", error)),
+        self.cancel_all_with_report(CancelAllStage::Recovery, "cancel all during recovery")
+            .await
+    }
+
+    async fn cancel_all_with_report(
+        &mut self,
+        stage: CancelAllStage,
+        operation: &'static str,
+    ) -> Result<(), EngineError> {
+        let symbol = *self.config.symbol();
+        self.publish_report(EngineReport::CancelAllStarted { stage, symbol });
+        let started = Instant::now();
+        let result = self.exchange.cancel_all(symbol).await;
+        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+        match result {
+            Ok(()) => {
+                self.publish_report(EngineReport::CancelAllFinished {
+                    stage,
+                    symbol,
+                    duration_us,
+                    result: Ok(()),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.publish_report(EngineReport::CancelAllFinished {
+                    stage,
+                    symbol,
+                    duration_us,
+                    result: Err(error.clone()),
+                });
+                Err(EngineError::exchange(operation, error))
+            }
         }
     }
 
     async fn stop(&mut self) -> Result<(), EngineError> {
         self.set_phase(EnginePhase::Stopping);
         let result = self
-            .exchange
-            .cancel_all(*self.config.symbol())
-            .await
-            .map_err(|error| EngineError::exchange("cancel all on shutdown", error));
+            .cancel_all_with_report(CancelAllStage::Shutdown, "cancel all on shutdown")
+            .await;
         self.registry.clear();
         self.placement_attempts.clear();
         self.inflight_placements.clear();

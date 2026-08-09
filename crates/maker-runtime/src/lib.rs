@@ -4,7 +4,7 @@ mod telemetry;
 pub use spsc::{SpscConsumer, SpscProducer, TryPushError, spsc_channel};
 pub use telemetry::{
     EngineRuntimePhase, EngineState, EventOrigin, EventSource, LatencySnapshot, RuntimeTelemetry,
-    SignedLatencySnapshot, TelemetrySnapshot, current_event_origin, unix_time_ms,
+    SignedLatencySnapshot, TelemetrySnapshot, current_event_origin, unix_time_us,
     with_event_origin,
 };
 

@@ -7,7 +7,7 @@ use maker_ports::{
     LatestBboSubscription, OrderUpdatePublisher, OrderUpdateSubscription, PrivateEvent,
     ReceivedPrivateEvent,
 };
-use maker_runtime::{EventSource, RuntimeTelemetry, unix_time_ms};
+use maker_runtime::{EventSource, RuntimeTelemetry, unix_time_us};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{
@@ -56,8 +56,13 @@ pub(crate) async fn subscribe_order_updates(
     telemetry: Option<RuntimeTelemetry>,
 ) -> ExchangeResult<EventStream<ReceivedPrivateEvent>> {
     let listen_key = rest.create_listen_key().await?;
-    let endpoint = stream_endpoint(websocket_url, &listen_key);
+    let endpoint = private_stream_endpoint(websocket_url, &listen_key);
     let socket = connect(&endpoint, connect_timeout).await?;
+    tracing::info!(
+        symbol = %target_symbol,
+        endpoint = %private_stream_endpoint(websocket_url, "<redacted>"),
+        "Binance private user-data WebSocket connected"
+    );
     let (sender, receiver) = OrderUpdateSubscription::channel(EVENT_BUFFER);
     tokio::spawn(run_order_updates(
         socket,
@@ -106,7 +111,7 @@ async fn run_book_ticker(
                 let received_ns = telemetry
                     .as_ref()
                     .map_or(0, RuntimeTelemetry::monotonic_time_ns);
-                let received_unix_ms = unix_time_ms();
+                let received_unix_us = unix_time_us();
                 let event: BookTickerEventDto = match serde_json::from_str(text.as_ref()) {
                     Ok(event) => event,
                     Err(error) => break error::invalid_response("bookTicker event", error),
@@ -115,7 +120,7 @@ async fn run_book_ticker(
                     telemetry.observe_exchange_event(
                         EventSource::MarketData,
                         received_ns,
-                        received_unix_ms,
+                        received_unix_us,
                         event.event_time,
                         event.transaction_time,
                     );
@@ -183,10 +188,16 @@ async fn run_order_updates(
                         let received_ns = telemetry
                             .as_ref()
                             .map_or(0, RuntimeTelemetry::monotonic_time_ns);
-                        let received_unix_ms = unix_time_ms();
+                        let received_unix_us = unix_time_us();
                         let event: PrivateEventDto = match serde_json::from_str(text.as_ref()) {
                             Ok(event) => event,
                             Err(error) => {
+                                tracing::error!(
+                                    symbol = %target_symbol,
+                                    error = %error,
+                                    raw_notification = %text,
+                                    "failed to parse Binance private user-data notification"
+                                );
                                 break error::invalid_response("user-data event", error);
                             }
                         };
@@ -199,7 +210,7 @@ async fn run_order_updates(
                                 observe_private_event(
                                     telemetry.as_ref(),
                                     received_ns,
-                                    received_unix_ms,
+                                    received_unix_us,
                                     event_time,
                                     transaction_time,
                                 );
@@ -235,7 +246,7 @@ async fn run_order_updates(
                                 observe_private_event(
                                     telemetry.as_ref(),
                                     received_ns,
-                                    received_unix_ms,
+                                    received_unix_us,
                                     event_time,
                                     transaction_time,
                                 );
@@ -274,7 +285,7 @@ async fn run_order_updates(
                                 observe_private_event(
                                     telemetry.as_ref(),
                                     received_ns,
-                                    received_unix_ms,
+                                    received_unix_us,
                                     event_time,
                                     transaction_time,
                                 );
@@ -302,7 +313,13 @@ async fn run_order_updates(
                                     "Binance listen key expired",
                                 );
                             }
-                            PrivateEventDto::Other => {}
+                            PrivateEventDto::Other => {
+                                tracing::warn!(
+                                    symbol = %target_symbol,
+                                    raw_notification = %text,
+                                    "unsupported Binance private user-data notification"
+                                );
+                            }
                         }
                     }
                     Ok(Message::Ping(payload)) => {
@@ -310,13 +327,25 @@ async fn run_order_updates(
                             break error::websocket(error);
                         }
                     }
-                    Ok(Message::Close(_)) => {
+                    Ok(Message::Close(frame)) => {
+                        tracing::warn!(
+                            symbol = %target_symbol,
+                            close_frame = ?frame,
+                            "Binance private user-data WebSocket close frame received"
+                        );
                         break ExchangeError::new(
                             ExchangeErrorKind::Network,
                             "Binance user-data WebSocket closed",
                         );
                     }
-                    Ok(Message::Binary(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                    Ok(Message::Binary(payload)) => {
+                        tracing::warn!(
+                            symbol = %target_symbol,
+                            payload_bytes = payload.len(),
+                            "Binance private user-data binary frame received"
+                        );
+                    }
+                    Ok(Message::Pong(_) | Message::Frame(_)) => {}
                     Err(error) => break error::websocket(error),
                 }
             }
@@ -358,6 +387,16 @@ fn stream_endpoint(base: &str, stream_name: &str) -> String {
     }
 }
 
+fn private_stream_endpoint(base: &str, listen_key: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let base = base.strip_suffix("/ws").unwrap_or(base);
+    if base.ends_with("/private") {
+        format!("{base}/ws?listenKey={listen_key}")
+    } else {
+        format!("{base}/private/ws?listenKey={listen_key}")
+    }
+}
+
 fn is_owned_target_limit_order(
     target_symbol: &Symbol,
     order: &crate::models::OrderTradeEventDto<'_>,
@@ -377,7 +416,7 @@ fn is_owned_target_trade_lite(
 fn observe_private_event(
     telemetry: Option<&RuntimeTelemetry>,
     received_ns: u64,
-    received_unix_ms: i64,
+    received_unix_us: i64,
     event_time: u64,
     transaction_time: u64,
 ) {
@@ -385,7 +424,7 @@ fn observe_private_event(
         telemetry.observe_exchange_event(
             EventSource::PrivateData,
             received_ns,
-            received_unix_ms,
+            received_unix_us,
             event_time,
             transaction_time,
         );
@@ -422,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_stream_urls_with_or_without_ws_suffix() {
+    fn builds_market_stream_urls_with_or_without_ws_suffix() {
         assert_eq!(
             stream_endpoint("wss://fstream.binance.com", "btcusdt@bookTicker"),
             "wss://fstream.binance.com/ws/btcusdt@bookTicker"
@@ -431,6 +470,22 @@ mod tests {
             stream_endpoint("wss://example.test/ws/", "listen-key"),
             "wss://example.test/ws/listen-key"
         );
+    }
+
+    #[test]
+    fn builds_private_stream_url_with_private_path() {
+        for base in [
+            "wss://fstream.binance.com",
+            "wss://fstream.binance.com/",
+            "wss://fstream.binance.com/ws",
+            "wss://fstream.binance.com/private",
+            "wss://fstream.binance.com/private/ws/",
+        ] {
+            assert_eq!(
+                private_stream_endpoint(base, "listen-key"),
+                "wss://fstream.binance.com/private/ws?listenKey=listen-key"
+            );
+        }
     }
 
     #[test]

@@ -37,9 +37,18 @@ const UNSIGNED_BUCKET_UPPER_NS: [u64; 26] = [
     u64::MAX,
 ];
 
-const SIGNED_BUCKET_UPPER_MS: [i64; 32] = [
-    -60_000,
-    -30_000,
+const SIGNED_BUCKET_UPPER_US: [i64; 50] = [
+    -60_000_000,
+    -30_000_000,
+    -10_000_000,
+    -5_000_000,
+    -2_000_000,
+    -1_000_000,
+    -500_000,
+    -200_000,
+    -100_000,
+    -50_000,
+    -20_000,
     -10_000,
     -5_000,
     -2_000,
@@ -67,8 +76,17 @@ const SIGNED_BUCKET_UPPER_MS: [i64; 32] = [
     2_000,
     5_000,
     10_000,
-    30_000,
-    60_000,
+    20_000,
+    50_000,
+    100_000,
+    200_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
     i64::MAX,
 ];
 
@@ -156,12 +174,12 @@ impl EventOrigin {
     }
 }
 
-/// Returns the current Unix wall-clock time in milliseconds.
-pub fn unix_time_ms() -> i64 {
-    let millis = SystemTime::now()
+/// Returns the current Unix wall-clock time in microseconds.
+pub fn unix_time_us() -> i64 {
+    let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    i64::try_from(millis).unwrap_or(i64::MAX)
+        .map_or(0, |duration| duration.as_micros());
+    i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
 /// Runs a synchronous exchange submission with the event that caused it.
@@ -222,7 +240,7 @@ impl UnsignedHistogram {
 }
 
 struct SignedHistogram {
-    buckets: [AtomicU64; SIGNED_BUCKET_UPPER_MS.len()],
+    buckets: [AtomicU64; SIGNED_BUCKET_UPPER_US.len()],
     sum: AtomicI64,
     maximum: AtomicI64,
 }
@@ -230,7 +248,7 @@ struct SignedHistogram {
 impl Default for SignedHistogram {
     fn default() -> Self {
         Self {
-            buckets: Default::default(),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             sum: AtomicI64::new(0),
             maximum: AtomicI64::new(i64::MIN),
         }
@@ -239,7 +257,7 @@ impl Default for SignedHistogram {
 
 impl SignedHistogram {
     fn observe(&self, value: i64) {
-        let index = SIGNED_BUCKET_UPPER_MS.partition_point(|upper| *upper < value);
+        let index = SIGNED_BUCKET_UPPER_US.partition_point(|upper| *upper < value);
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
         self.maximum.fetch_max(value, Ordering::Relaxed);
@@ -290,7 +308,7 @@ fn unsigned_percentile(
 }
 
 fn signed_percentile(
-    counts: &[u64; SIGNED_BUCKET_UPPER_MS.len()],
+    counts: &[u64; SIGNED_BUCKET_UPPER_US.len()],
     samples: u64,
     percentile: u64,
     maximum: i64,
@@ -303,7 +321,7 @@ fn signed_percentile(
     for (index, count) in counts.iter().enumerate() {
         cumulative = cumulative.saturating_add(*count);
         if cumulative >= rank {
-            return SIGNED_BUCKET_UPPER_MS[index].min(maximum);
+            return SIGNED_BUCKET_UPPER_US[index].min(maximum);
         }
     }
     maximum
@@ -311,14 +329,19 @@ fn signed_percentile(
 
 struct RuntimeTelemetryInner {
     epoch: Instant,
-    market_event_delay_ms: SignedHistogram,
-    market_transaction_delay_ms: SignedHistogram,
-    private_event_delay_ms: SignedHistogram,
-    private_transaction_delay_ms: SignedHistogram,
+    market_event_delay_us: SignedHistogram,
+    market_transaction_delay_us: SignedHistogram,
+    private_event_delay_us: SignedHistogram,
+    private_transaction_delay_us: SignedHistogram,
     market_strategy_reaction_ns: UnsignedHistogram,
     private_strategy_reaction_ns: UnsignedHistogram,
     event_request_dispatch_ns: UnsignedHistogram,
     background_request_dispatch_ns: UnsignedHistogram,
+    request_queue_wait_ns: UnsignedHistogram,
+    request_enqueue_to_dequeue_ns: UnsignedHistogram,
+    request_preflight_wait_ns: UnsignedHistogram,
+    request_prepare_ns: UnsignedHistogram,
+    socket_send_ns: UnsignedHistogram,
     market_end_to_end_ns: UnsignedHistogram,
     private_end_to_end_ns: UnsignedHistogram,
     market_events: AtomicU64,
@@ -356,14 +379,19 @@ impl Default for RuntimeTelemetryInner {
     fn default() -> Self {
         Self {
             epoch: Instant::now(),
-            market_event_delay_ms: SignedHistogram::default(),
-            market_transaction_delay_ms: SignedHistogram::default(),
-            private_event_delay_ms: SignedHistogram::default(),
-            private_transaction_delay_ms: SignedHistogram::default(),
+            market_event_delay_us: SignedHistogram::default(),
+            market_transaction_delay_us: SignedHistogram::default(),
+            private_event_delay_us: SignedHistogram::default(),
+            private_transaction_delay_us: SignedHistogram::default(),
             market_strategy_reaction_ns: UnsignedHistogram::default(),
             private_strategy_reaction_ns: UnsignedHistogram::default(),
             event_request_dispatch_ns: UnsignedHistogram::default(),
             background_request_dispatch_ns: UnsignedHistogram::default(),
+            request_queue_wait_ns: UnsignedHistogram::default(),
+            request_enqueue_to_dequeue_ns: UnsignedHistogram::default(),
+            request_preflight_wait_ns: UnsignedHistogram::default(),
+            request_prepare_ns: UnsignedHistogram::default(),
+            socket_send_ns: UnsignedHistogram::default(),
             market_end_to_end_ns: UnsignedHistogram::default(),
             private_end_to_end_ns: UnsignedHistogram::default(),
             market_events: AtomicU64::new(0),
@@ -430,21 +458,21 @@ impl RuntimeTelemetry {
         &self,
         source: EventSource,
         received_ns: u64,
-        received_unix_ms: i64,
+        received_unix_us: i64,
         exchange_event_ms: u64,
         exchange_transaction_ms: u64,
     ) {
-        let event_delay = wall_clock_delta(received_unix_ms, exchange_event_ms);
-        let transaction_delay = wall_clock_delta(received_unix_ms, exchange_transaction_ms);
+        let event_delay = wall_clock_delta_us(received_unix_us, exchange_event_ms);
+        let transaction_delay = wall_clock_delta_us(received_unix_us, exchange_transaction_ms);
         match source {
             EventSource::MarketData => {
                 self.inner.market_events.fetch_add(1, Ordering::Relaxed);
                 self.inner
                     .last_market_receive_ns
                     .store(received_ns, Ordering::Relaxed);
-                self.inner.market_event_delay_ms.observe(event_delay);
+                self.inner.market_event_delay_us.observe(event_delay);
                 self.inner
-                    .market_transaction_delay_ms
+                    .market_transaction_delay_us
                     .observe(transaction_delay);
             }
             EventSource::PrivateData => {
@@ -452,9 +480,9 @@ impl RuntimeTelemetry {
                 self.inner
                     .last_private_receive_ns
                     .store(received_ns, Ordering::Relaxed);
-                self.inner.private_event_delay_ms.observe(event_delay);
+                self.inner.private_event_delay_us.observe(event_delay);
                 self.inner
-                    .private_transaction_delay_ms
+                    .private_transaction_delay_us
                     .observe(transaction_delay);
             }
         }
@@ -479,10 +507,28 @@ impl RuntimeTelemetry {
         &self,
         origin: Option<EventOrigin>,
         submitted_ns: u64,
+        dequeued_ns: u64,
+        prepare_started_ns: u64,
+        send_started_ns: u64,
         sent_ns: u64,
     ) {
         self.inner.requests_sent.fetch_add(1, Ordering::Relaxed);
         let dispatch = sent_ns.saturating_sub(submitted_ns);
+        self.inner
+            .request_queue_wait_ns
+            .observe(prepare_started_ns.saturating_sub(submitted_ns));
+        self.inner
+            .request_enqueue_to_dequeue_ns
+            .observe(dequeued_ns.saturating_sub(submitted_ns));
+        self.inner
+            .request_preflight_wait_ns
+            .observe(prepare_started_ns.saturating_sub(dequeued_ns));
+        self.inner
+            .request_prepare_ns
+            .observe(send_started_ns.saturating_sub(prepare_started_ns));
+        self.inner
+            .socket_send_ns
+            .observe(sent_ns.saturating_sub(send_started_ns));
         let Some(origin) = origin else {
             self.inner.background_request_dispatch_ns.observe(dispatch);
             return;
@@ -629,22 +675,28 @@ impl RuntimeTelemetry {
                 now,
                 self.inner.last_private_receive_ns.load(Ordering::Relaxed),
             ),
-            market_event_delay_ms: self.inner.market_event_delay_ms.take(),
-            market_transaction_delay_ms: self.inner.market_transaction_delay_ms.take(),
-            private_event_delay_ms: self.inner.private_event_delay_ms.take(),
-            private_transaction_delay_ms: self.inner.private_transaction_delay_ms.take(),
+            market_event_delay_us: self.inner.market_event_delay_us.take(),
+            market_transaction_delay_us: self.inner.market_transaction_delay_us.take(),
+            private_event_delay_us: self.inner.private_event_delay_us.take(),
+            private_transaction_delay_us: self.inner.private_transaction_delay_us.take(),
             market_strategy_reaction_ns: self.inner.market_strategy_reaction_ns.take(),
             private_strategy_reaction_ns: self.inner.private_strategy_reaction_ns.take(),
             event_request_dispatch_ns: self.inner.event_request_dispatch_ns.take(),
             background_request_dispatch_ns: self.inner.background_request_dispatch_ns.take(),
+            request_queue_wait_ns: self.inner.request_queue_wait_ns.take(),
+            request_enqueue_to_dequeue_ns: self.inner.request_enqueue_to_dequeue_ns.take(),
+            request_preflight_wait_ns: self.inner.request_preflight_wait_ns.take(),
+            request_prepare_ns: self.inner.request_prepare_ns.take(),
+            socket_send_ns: self.inner.socket_send_ns.take(),
             market_end_to_end_ns: self.inner.market_end_to_end_ns.take(),
             private_end_to_end_ns: self.inner.private_end_to_end_ns.take(),
         }
     }
 }
 
-fn wall_clock_delta(received_unix_ms: i64, exchange_ms: u64) -> i64 {
-    let delta = i128::from(received_unix_ms) - i128::from(exchange_ms);
+fn wall_clock_delta_us(received_unix_us: i64, exchange_ms: u64) -> i64 {
+    let exchange_us = i128::from(exchange_ms).saturating_mul(1_000);
+    let delta = i128::from(received_unix_us) - exchange_us;
     i64::try_from(delta).unwrap_or(if delta.is_negative() {
         i64::MIN
     } else {
@@ -697,14 +749,19 @@ pub struct TelemetrySnapshot {
     pub engine_state: EngineState,
     pub last_market_event_age_ns: Option<u64>,
     pub last_private_event_age_ns: Option<u64>,
-    pub market_event_delay_ms: SignedLatencySnapshot,
-    pub market_transaction_delay_ms: SignedLatencySnapshot,
-    pub private_event_delay_ms: SignedLatencySnapshot,
-    pub private_transaction_delay_ms: SignedLatencySnapshot,
+    pub market_event_delay_us: SignedLatencySnapshot,
+    pub market_transaction_delay_us: SignedLatencySnapshot,
+    pub private_event_delay_us: SignedLatencySnapshot,
+    pub private_transaction_delay_us: SignedLatencySnapshot,
     pub market_strategy_reaction_ns: LatencySnapshot,
     pub private_strategy_reaction_ns: LatencySnapshot,
     pub event_request_dispatch_ns: LatencySnapshot,
     pub background_request_dispatch_ns: LatencySnapshot,
+    pub request_queue_wait_ns: LatencySnapshot,
+    pub request_enqueue_to_dequeue_ns: LatencySnapshot,
+    pub request_preflight_wait_ns: LatencySnapshot,
+    pub request_prepare_ns: LatencySnapshot,
+    pub socket_send_ns: LatencySnapshot,
     pub market_end_to_end_ns: LatencySnapshot,
     pub private_end_to_end_ns: LatencySnapshot,
 }
@@ -732,13 +789,18 @@ mod tests {
         let telemetry = RuntimeTelemetry::new();
         let origin = EventOrigin::new(EventSource::PrivateData, 1_000).unwrap();
         telemetry.observe_request_submitted(Some(origin), 11_000);
-        telemetry.observe_request_sent(Some(origin), 11_000, 31_000);
+        telemetry.observe_request_sent(Some(origin), 11_000, 14_000, 16_000, 23_000, 31_000);
 
         let snapshot = telemetry.take_snapshot();
         assert_eq!(snapshot.event_requests, 1);
         assert_eq!(snapshot.requests_sent, 1);
         assert_eq!(snapshot.private_strategy_reaction_ns.mean, 10_000);
         assert_eq!(snapshot.event_request_dispatch_ns.mean, 20_000);
+        assert_eq!(snapshot.request_queue_wait_ns.mean, 5_000);
+        assert_eq!(snapshot.request_enqueue_to_dequeue_ns.mean, 3_000);
+        assert_eq!(snapshot.request_preflight_wait_ns.mean, 2_000);
+        assert_eq!(snapshot.request_prepare_ns.mean, 7_000);
+        assert_eq!(snapshot.socket_send_ns.mean, 8_000);
         assert_eq!(snapshot.background_request_dispatch_ns.samples, 0);
         assert_eq!(snapshot.private_end_to_end_ns.mean, 30_000);
     }
@@ -746,12 +808,12 @@ mod tests {
     #[test]
     fn keeps_negative_exchange_clock_deltas_visible() {
         let telemetry = RuntimeTelemetry::new();
-        telemetry.observe_exchange_event(EventSource::MarketData, 10, 900, 1_000, 950);
+        telemetry.observe_exchange_event(EventSource::MarketData, 10, 900_250, 1_000, 950);
 
         let snapshot = telemetry.take_snapshot();
         assert_eq!(snapshot.market_events, 1);
-        assert_eq!(snapshot.market_event_delay_ms.mean, -100);
-        assert_eq!(snapshot.market_transaction_delay_ms.mean, -50);
+        assert_eq!(snapshot.market_event_delay_us.mean, -99_750);
+        assert_eq!(snapshot.market_transaction_delay_us.mean, -49_750);
     }
 
     #[test]
