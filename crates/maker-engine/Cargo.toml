@@ -1,0 +1,19 @@
+[package]
+name = "maker-engine"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+futures-util = "0.3"
+maker-domain = { path = "../maker-domain" }
+maker-ports = { path = "../maker-ports" }
+maker-runtime = { path = "../maker-runtime" }
+rust_decimal = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"

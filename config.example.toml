@@ -1,0 +1,52 @@
+# LIVE MAINNET CONFIGURATION
+# Running the program immediately cancels every open order for `symbol` and
+# places real Binance USD-M Futures orders.
+
+[exchange]
+rest_url = "https://fapi.binance.com"
+websocket_url = "wss://fstream.binance.com"
+websocket_api_url = "wss://ws-fapi.binance.com/ws-fapi/v1"
+api_key = "replace-with-binance-api-key"
+private_key_pem = '''-----BEGIN PRIVATE KEY-----
+replace-with-binance-ed25519-pkcs8-private-key
+-----END PRIVATE KEY-----
+'''
+recv_window_ms = 5000
+request_timeout_ms = 5000
+listen_key_keepalive_secs = 1800
+websocket_idle_timeout_secs = 240
+
+[strategy]
+symbol = "BTCUSDT"
+# Fixed engine storage supports 1 through 64 levels per side.
+levels_per_side = 5
+inner_ticks = 10
+spacing_ticks = 5
+take_profit_ticks = 3
+quantity = "0.001"
+
+[runtime]
+reconcile_interval_ms = 1000
+instrument_refresh_interval_secs = 3600
+reconnect_delay_ms = 1000
+strategy_mode = "busy_spin"
+# Zero-based selector resolved by core_affinity. Linux pins the thread to the
+# selected allowed logical CPU. CPU affinity is unavailable on macOS.
+strategy_cpu_core = 1
+# Public book-ticker traffic is isolated on its own network thread.
+market_data_mode = "event_driven"
+market_data_cpu_core = 3
+# Private user-data and trading API traffic use the latency-prioritized thread.
+trading_mode = "event_driven"
+trading_cpu_core = 2
+
+[logging]
+level = "info"
+directory = "logs"
+retention_days = 14
+# Set true to also write compact logs to stdout.
+stdout = false
+# Lock-free counters are aggregated on hot threads and logged by the CLI at
+# this interval. Local reaction/send latency is reported in nanoseconds;
+# exchange timestamp delay is reported in microseconds.
+telemetry_interval_secs = 10
