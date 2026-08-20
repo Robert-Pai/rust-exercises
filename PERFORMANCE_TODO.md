@@ -1,32 +1,52 @@
-# Fixed-capacity container follow-ups
+# 固定容量容器后续工作
 
-Hot cached elements now use inline/numeric identities. The following dynamic containers remain intentionally unchanged until their hard capacities and overflow semantics are selected.
+热点缓存元素现在使用内联/数值身份。以下动态容器在明确其硬容量和溢出语义之前，
+仍会有意保持不变。
 
-## Engine fixed-capacity state (completed)
+## 引擎固定容量状态（已完成）
 
-- Engine configuration now rejects more than 64 levels per side (128 total).
-- `OrderRegistry` and all client-order lifecycle maps/sets use 256 direct-addressed slots indexed by the low `ClientOrderId` byte. Every lookup, mutation, and removal validates the complete ID; a collision reports capacity exhaustion and never evicts live or stale state.
-- Deferred placements, placement priority, desired/blocked reconciliation levels, cancellation snapshots, recovery snapshots, and pending-fill FIFO storage use inline fixed arrays.
-- Placement and cancellation slots are reserved before the exchange future is dispatched. Partial reservation rolls back without sending a command.
-- Pending fills retain strict arrival FIFO: a blocked head fill prevents later fills from overtaking it. Overflow enters recovery without eviction.
-- Reconciliation and recovery no longer allocate temporary `Vec`/`HashSet` snapshots. Their local inline arrays are rebuilt on the stack for each pass; `GridModel`'s internal `BTreeMap`s, boxed exchange futures, and `FuturesUnordered` command nodes remain intentionally out of scope.
+- 引擎配置现在会拒绝每侧超过 64 个价位（总计 128 个）。
+- `OrderRegistry` 以及所有客户端订单生命周期映射/集合都使用 256 个直接寻址槽位，
+  由 `ClientOrderId` 的低字节索引。每次查找、变更和移除都会校验完整 ID；发生冲突
+  时会报告容量耗尽，绝不会驱逐仍存活或已过期的状态。
+- 延迟下单、下单优先级、目标/阻塞协调价位、取消快照、恢复快照以及待处理成交 FIFO
+  存储都使用内联固定数组。
+- 下单和取消槽位会在分发交易所 future 之前预留。部分预留失败时会回滚，且不会发送命令。
+- 待处理成交严格保持到达 FIFO 顺序：被阻塞的队首成交会阻止后续成交超越它。容量溢出
+  时会进入恢复流程，且不会驱逐已有数据。
+- 协调和恢复不再分配临时 `Vec`/`HashSet` 快照。每次处理都会在栈上使用本地内联数组
+  重建快照；`GridModel` 内部的 `BTreeMap`、装箱的交易所 future 以及
+  `FuturesUnordered` 命令节点仍有意排除在范围之外。
 
-## Adapter and trading runtime fixed-capacity state (completed)
+## 适配器和交易运行时固定容量状态（已完成）
 
-- `BinanceUsdm::instrument: Option<InstrumentSpec>` stores the intentionally single-symbol snapshot directly. Multi-symbol support requires a separate ownership and capacity design.
-- WebSocket API pending requests use 256 direct-addressed transport slots indexed by the low request-ID byte and validated against the complete transport ID.
-- The worker owns absolute response deadlines beginning at strategy-side enqueue, bounds socket writes, expires abandoned requests, skips closed replies, and preserves deadlines across retries.
-- At full pending capacity the worker stops admitting commands until a response or timeout frees a slot. No resident request is overwritten or evicted; unexpected below-capacity collisions reset the connection and fail pending requests so exchange mutations remain explicit.
+- `BinanceUsdm::instrument: Option<InstrumentSpec>` 直接存储有意限制为单品种的快照。
+  支持多品种需要单独的所有权和容量设计。
+- WebSocket API 待处理请求使用 256 个直接寻址的传输槽位，由请求 ID 的低字节索引，
+  并校验完整的传输 ID。
+- worker 从策略侧入队时开始记录绝对响应截止时间；它会限制套接字写入、使被放弃的
+  请求过期、跳过已关闭的响应，并在重试时保留截止时间。
+- 待处理容量达到上限时，worker 会停止接纳命令，直到响应或超时释放槽位。不会覆盖或
+  驱逐任何驻留请求；低于容量上限时出现意外冲突，会重置连接并使待处理请求失败，
+  从而明确记录交易所变更结果。
 
-## Temporary reconciliation allocations (completed)
+## 临时协调分配（已完成）
 
-Engine desired, unresolved, recovery, cancellation, and blocked-level snapshots now use local inline fixed arrays bounded by the validated 128 total grid levels or 256 lifecycle slots. Sorting and deduplication operate in place. `GridModel` now exposes a non-allocating level visitor while retaining its existing snapshot API.
+引擎的目标、未解析、恢复、取消和阻塞价位快照现在使用本地内联固定数组，其容量由
+已校验的总计 128 个网格价位或 256 个生命周期槽位限定。排序和去重均在原地进行。
+`GridModel` 现在提供不分配内存的价位访问器，同时保留现有的快照 API。
 
-## Completed cross-thread paths
+## 已完成的跨线程路径
 
-- Public BBO uses a cache-line-aligned, two-slot latest-value mailbox. The market-data thread is the single writer; strategy reads the newest coherent snapshot directly, and stale intermediate books are overwritten.
-- BBO wakeups use an atomic generation plus `AtomicWaker`; terminal health uses a capacity-one SPSC separate from snapshot storage, so strategy decisions do not wait for queued book payloads.
-- Market-data and trading runtime task inboxes are independent capacity-64 SPSC rings. One strategy OS thread owns their physical producers; each named network thread owns one consumer.
-- WebSocket API requests use a capacity-256 SPSC command ring from strategy to the persistent trading worker. Concurrent strategy futures share one thread-affine physical producer; per-request results remain one-shot replies.
-- Private order updates use a capacity-256 SPSC FIFO from the trading thread to strategy. Full capacity never overwrites lifecycle events: buffered updates drain first, then an out-of-band terminal error forces stream recovery.
-- Ring producer/consumer indices are cache-separated by the underlying SPSC implementation. Ordinary compact event values are not individually cache-line aligned.
+- 公共 BBO 使用按缓存行对齐的双槽最新值邮箱。市场数据线程是唯一写入方；策略线程
+  直接读取最新的一致快照，中间产生的过期订单簿会被覆盖。
+- BBO 唤醒使用原子代数加 `AtomicWaker`；终止健康状态使用容量为 1 的独立 SPSC，
+  与快照存储分离，因此策略决策不会等待排队的订单簿数据。
+- 市场数据和交易运行时任务收件箱是相互独立的容量 64 SPSC 环。一个策略操作系统线程
+  拥有它们的物理生产者；每个具名网络线程拥有一个消费者。
+- WebSocket API 请求通过容量 256 的 SPSC 命令环从策略线程发送到持久交易 worker。
+  并发的策略 future 共享一个绑定线程的物理生产者；每个请求的结果仍是一次性响应。
+- 私有订单更新通过容量 256 的 SPSC FIFO 从交易线程发送到策略线程。容量满时绝不会
+  覆盖生命周期事件：先排空已缓冲的更新，然后通过带外终止错误强制恢复流。
+- 环形缓冲区的生产者/消费者索引由底层 SPSC 实现分隔在不同缓存行。普通的紧凑事件值
+  不会单独按缓存行对齐。
